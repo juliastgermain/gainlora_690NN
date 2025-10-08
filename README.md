@@ -27,15 +27,22 @@ Continual learning (CL), which requires the model to learn multiple tasks sequen
 ```
 bash gen_script_superni_order1_t5_gainlora_inflora.sh your_device_id model_path_for_t5_large
 bash gen_script_superni_order2_t5_gainlora_inflora.sh your_device_id model_path_for_t5_large
-bash gen_script_long_order3_t5_gainlora_inflora.sh your_device_id model_path_for_t5_large
-bash gen_script_long_order4_t5_gainlora_inflora.sh your_device_id model_path_for_t5_large
 ```
 #### InfLoRA
 ```
 bash gen_script_superni_order1_t5_inflora.sh your_device_id model_path_for_t5_large
 bash gen_script_superni_order2_t5_inflora.sh your_device_id model_path_for_t5_large
-bash gen_script_long_order3_t5_inflora.sh your_device_id model_path_for_t5_large
-bash gen_script_long_order4_t5_inflora.sh your_device_id model_path_for_t5_large
+```
+
+#### GainLoRA with OLoRA
+```
+bash gen_script_superni_order1_t5_gainlora_olora.sh your_device_id model_path_for_t5_large
+bash gen_script_superni_order2_t5_gainlora_olora.sh your_device_id model_path_for_t5_large
+```
+#### OLoRA
+```
+bash gen_script_superni_order1_t5_olora.sh your_device_id model_path_for_t5_large
+bash gen_script_superni_order2_t5_olora.sh your_device_id model_path_for_t5_large
 ```
 
 ### Llama-2-7B Experiments
