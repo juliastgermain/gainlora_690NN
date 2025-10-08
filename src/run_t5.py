@@ -460,10 +460,10 @@ def main():
         'lora_dropout': model_args.lora_dropout
     }
 
-    if training_args.model_name in ['gainlora_inflora']:
-        from t5_large import T5ForConditionalGeneration
-    elif training_args.model_name in ['inflora']:
+    if training_args.model_name in ['inflora', 'olora']:
         from t5_inflora import T5ForConditionalGeneration
+    elif training_args.model_name in ['gainlora_inflora', 'gainlora_olora']:
+        from t5_gainlora_inflora import T5ForConditionalGeneration
     else:
         raise NotImplementedError
 
@@ -485,16 +485,16 @@ def main():
         device = torch.device(f"cuda:{local_rank}")
     except:
         device = torch.device(f"cuda:0")
-    if model_args.load_checkpoint_from and training_args.model_name in ['gainlora_inflora']:
+    if model_args.load_checkpoint_from:
         print("----------Loading Previous Query Projection Layer----------")
         model.encoder.trans_input.load_state_dict(torch.load(model_args.load_checkpoint_from, map_location=device))
-        # ipdb.set_trace()
-        model.encoder.previous_trans_input.input_linear[0].data.copy_(torch.load(model_args.load_checkpoint_from, map_location=device)['0.weight'])
-        model.encoder.previous_trans_input.output_linear[0].data.copy_(torch.load(model_args.load_checkpoint_from, map_location=device)['2.weight'])
-        model.encoder.previous_trans_input.state_dict()
-        if cur_task_id > 1:
-            model.encoder.previous_trans_input.input_linear[1:].data.copy_(torch.load(model_args.load_checkpoint_from.replace('trans_input.pt', 'previous_trans_input.pt'), map_location=device)['input_linear'])
-            model.encoder.previous_trans_input.output_linear[1:].data.copy_(torch.load(model_args.load_checkpoint_from.replace('trans_input.pt', 'previous_trans_input.pt'), map_location=device)['output_linear'])
+        if training_args.model_name in ['gainlora_inflora', 'gainlora_olora']:
+            model.encoder.previous_trans_input.input_linear[0].data.copy_(torch.load(model_args.load_checkpoint_from, map_location=device)['0.weight'])
+            model.encoder.previous_trans_input.output_linear[0].data.copy_(torch.load(model_args.load_checkpoint_from, map_location=device)['2.weight'])
+            model.encoder.previous_trans_input.state_dict()
+            if cur_task_id > 1:
+                model.encoder.previous_trans_input.input_linear[1:].data.copy_(torch.load(model_args.load_checkpoint_from.replace('trans_input.pt', 'previous_trans_input.pt'), map_location=device)['input_linear'])
+                model.encoder.previous_trans_input.output_linear[1:].data.copy_(torch.load(model_args.load_checkpoint_from.replace('trans_input.pt', 'previous_trans_input.pt'), map_location=device)['output_linear'])
         print("----------Loading Previous Query Projection Layer Done----------")
 
     if model_args.previous_lora_path:
@@ -547,7 +547,7 @@ def main():
                 )
 
     for name, param in model.named_parameters():
-        if  training_args.model_name in ['gainlora_olora']:
+        if  training_args.model_name in ['gainlora_olora', 'olora']:
             param.requires_grad = False
             if ("lora" in name and "previous_lora_weights" not in name) or ("trans_input" in name and "previous_trans_input" not in name) or "prompt_key" in name:
                 param.requires_grad = True
@@ -711,8 +711,8 @@ def main():
                 module.get_chunk(training_args.chunk)
         if training_args.model_name in ['gainlora_inflora']:
             model.encoder.get_chunk(training_args.chunk)
-    else:
-        raise NotImplementedError
+    elif training_args.model_name in ['gainlora_olora']:
+        model.encoder.get_chunk(training_args.chunk)
     if training_args.model_name == 'gainlora_inflora':
         from cl_trainer_gainlora_inflora import GainLoRA_InfLoRA_Trainer
         trainer = GainLoRA_InfLoRA_Trainer(
@@ -732,9 +732,9 @@ def main():
         )
         if training_args.do_train:
             trainer.get_reg_matrix()
-    elif training_args.model_name == 'inflora':
-        from cl_trainer_inflora import InfLoRA_Trainer
-        trainer = InfLoRA_Trainer(
+    elif training_args.model_name == 'gainlora_olora':
+        from cl_trainer_gainlora_olora import GainLoRA_OLoRA_Trainer
+        trainer = GainLoRA_OLoRA_Trainer(
             model=model,
             args=training_args,
             train_dataset=train_dataset if training_args.do_train else None,
@@ -751,6 +751,42 @@ def main():
         )
         if training_args.do_train:
             trainer.get_reg_matrix()
+    elif training_args.model_name == 'inflora':
+        from cl_trainer_inflora import InfLoRATrainer
+        trainer = InfLoRATrainer(
+            model=model,
+            args=training_args,
+            train_dataset=train_dataset if training_args.do_train else None,
+            cur_task_id=cur_task_id,
+            task_order=task_order,
+            data_collator_replay=data_collator_replay,
+            replay_dataset_dict=replay_dataset_dict,
+            replay_label_dict=replay_label_dict,
+            eval_dataset=eval_dataset if training_args.do_eval else None,
+            tokenizer=tokenizer,
+            data_collator=data_collator,
+            compute_metrics=compute_rouge_metrics,
+            callbacks=[DenserEvalCallback] if training_args.denser_evaluation else None
+        )
+        if training_args.do_train:
+            trainer.get_reg_matrix()
+    elif training_args.model_name == 'olora':
+        from cl_trainer_olora import OLoRATrainer
+        trainer = OLoRATrainer(
+            model=model,
+            args=training_args,
+            train_dataset=train_dataset if training_args.do_train else None,
+            cur_task_id=cur_task_id,
+            task_order=task_order,
+            data_collator_replay=data_collator_replay,
+            replay_dataset_dict=replay_dataset_dict,
+            replay_label_dict=replay_label_dict,
+            eval_dataset=eval_dataset if training_args.do_eval else None,
+            tokenizer=tokenizer,
+            data_collator=data_collator,
+            compute_metrics=compute_rouge_metrics,
+            callbacks=[DenserEvalCallback] if training_args.denser_evaluation else None
+        )
     else:
         raise NotImplementedError
 
@@ -776,7 +812,7 @@ def main():
                 pass
 
         if not prompt_config["run_single"]:
-            if prompt_config["previous_prompt_key_path"] is not None and training_args.model_name in ['gainlora_inflora']:
+            if training_args.model_name in ['gainlora_inflora', 'gainlora_olora'] and prompt_config["previous_prompt_key_path"] is not None:
                 previous_trans_input = deepcopy(trainer.model.encoder.previous_trans_input.state_dict())
                 torch.save(previous_trans_input, os.path.join(save_path, 'previous_trans_input.pt'))
             torch.save(trainer.model.encoder.trans_input.state_dict(), os.path.join(save_path, 'trans_input.pt'))
@@ -806,7 +842,8 @@ def main():
         logger.info(f"Metrics {metrics}")
         all_metrics.update(metrics)
 
-        trainer.get_repsentation()
+        if training_args.model_name in ['inflora', 'gainlora_inflora', 'gainlora_olora']:
+            trainer.get_repsentation()
 
     # Evaluation
     results = {}
@@ -848,31 +885,6 @@ def main():
             trainer.model.encoder.is_inference = False
 
         if training_args.do_predict:
-
-
-            if training_args.model_name in ["gainlora_inflora", "inflora"]:
-                trainer.model.encoder.is_inference = True
-                all_group_accs = []
-                for task_id in range(cur_task_id + 1):
-                    del trainer.model.encoder.all_attn_weights
-                    trainer.model.encoder.all_attn_weights = []
-                    select_indexs = [id for id, instance in enumerate(predict_dataset) if task_order.index(instance['Dataset']) == task_id]
-                    select_predict_dataset = predict_dataset.select(select_indexs)
-                    predict_results = trainer.predict(
-                        select_predict_dataset,
-                        metric_key_prefix="predict",
-                        max_new_tokens=max_new_tokens,
-                        num_beams=num_beams,
-                        repetition_penalty=repetition_penalty,
-                        pad_token_id=tokenizer.pad_token_id
-                    )
-                    all_group_accs.append(np.array(np.concatenate(trainer.model.encoder.all_attn_weights)).mean(axis=0))
-                    print(np.array(np.concatenate(trainer.model.encoder.all_attn_weights)).mean(axis=0))
-                with open(os.path.join(training_args.output_dir, "group_acc.txt"), 'w') as f:
-                    f.write(str(all_group_accs))
-                trainer.model.encoder.is_inference = False
-
-
             predict_results = trainer.predict(
                 predict_dataset,
                 metric_key_prefix="predict",

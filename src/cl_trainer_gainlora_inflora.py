@@ -72,6 +72,40 @@ class GainLoRA_InfLoRA_Trainer(Seq2SeqTrainer):
         self.task_order = task_order
         self.cur_task_id = cur_task_id
 
+        if self.args.data_replay_freq != -1:
+            seed = self.args.data_seed if self.args.data_seed is not None else self.args.seed
+            self.replay_dataloader_dict = {}
+            generator = torch.Generator()
+            generator.manual_seed(seed)
+            if replay_dataset_dict is not None:
+                for dataset_name, dataset in self.replay_dataset_dict.items():
+                    train_sampler = RandomSampler(dataset, generator=generator)
+                    self.replay_dataloader_dict[dataset_name] = DataLoader(
+                        dataset,
+                        batch_size=self._train_batch_size,
+                        sampler=train_sampler,
+                        collate_fn=self.data_collator_replay,
+                        drop_last=self.args.dataloader_drop_last,
+                        num_workers=self.args.dataloader_num_workers,
+                        pin_memory=False,
+                        worker_init_fn=seed_worker)
+            self.replay_iterator_dict = create_memory_replay_generators(task_order[cur_task_id], task_order, self.replay_dataloader_dict)
+
+    def get_validate_dataset(self,):
+        seed = self.args.data_seed if self.args.data_seed is not None else self.args.seed
+        generator = torch.Generator()
+        generator.manual_seed(seed)
+        train_sampler = RandomSampler(self.select_predict_dataset, generator=generator)
+        self.select_predict_dataloader = DataLoader(
+                        self.select_predict_dataset,
+                        batch_size=self._train_batch_size,
+                        sampler=train_sampler,
+                        collate_fn=self.data_collator_replay,
+                        drop_last=self.args.dataloader_drop_last,
+                        num_workers=self.args.dataloader_num_workers,
+                        pin_memory=False,
+                        worker_init_fn=seed_worker)
+        self.select_predict_iter = iter(self.select_predict_dataloader)
     
     def load_previous_reg_matrix(self):
         paths = self.args.output_dir.split('/')
@@ -106,20 +140,17 @@ class GainLoRA_InfLoRA_Trainer(Seq2SeqTrainer):
 
 
     def get_reg_matrix(self):
-        # if self.args.lamda_1 <= 1e-6:
-        #     return
         self.feature_list, self.feature_trans_list, self._cur_task = self.load_previous_reg_matrix()
-        # import ipdb
 
         train_dataloader = self.get_train_dataloader()
         if isinstance(train_dataloader, DataLoader) and isinstance(train_dataloader.sampler, DistributedSampler):
             train_dataloader.sampler.set_epoch(1998)
         elif hasattr(train_dataloader, "dataset") and isinstance(train_dataloader.dataset, IterableDatasetShard):
             train_dataloader.dataset.set_epoch(1998)
-        for name, module in self.model.named_modules():
-            if hasattr(module, 'get_feature'):
-                module.get_feature=True
-                module.stage = 0
+        # for name, module in self.model.named_modules():
+        #     if hasattr(module, 'get_feature'):
+        #         module.get_feature=True
+        #         module.stage = 0
         self.model.encoder.get_trans_feature = True
         self.model.encoder.stage_trans = 0
 
@@ -136,23 +167,7 @@ class GainLoRA_InfLoRA_Trainer(Seq2SeqTrainer):
                 if step > 1000: break
         print('end get representation')
 
-        if len(self.feature_list) == 0:
-            i = 0
-            for module in self.model.modules():
-                if hasattr(module, 'get_feature'):
-                    for index in module.matrix.keys():
-                        cur_matrix = module.matrix[index]
-                        U, S, V = torch.linalg.svd(cur_matrix)
-                        module.lora_q.lora_A.data[:,index*module.step:(index+1)*module.step].copy_(U[:,:module.lora_q.r].T)
-                        module.lora_v.lora_A.data[:,index*module.step:(index+1)*module.step].copy_(U[:,:module.lora_v.r].T)
-                        module.matrix[index].zero_()
-                        module.n_matrix[index] = 0
-                    module.lora_q.lora_A.data /= math.sqrt(module.chunk*3)
-                    module.lora_v.lora_A.data /= math.sqrt(module.chunk*3)
-                    i += 1
-                    module.get_feature=False
-                    module.stage = 0
-
+        if len(self.feature_trans_list) == 0:
             module = self.model.encoder
             pre_norm = module.prompt_key.detach().norm()
             for index in module.matrix_trans_3.keys():
@@ -170,12 +185,19 @@ class GainLoRA_InfLoRA_Trainer(Seq2SeqTrainer):
             module.stage_trans=0
         else:
             self.feature_mat, i = [], 0
-            for module in self.model.modules():
+            for name, module in self.model.named_modules():
                 if hasattr(module, 'get_feature'):
                     feature_mat = {}
+                    # Projection Matrix Precomputation
                     for index in self.feature_list[i].keys():
-                        feature_mat[index] = torch.mm(self.feature_list[i][index], self.feature_list[i][index].T)
+                        feature_mat[index] = torch.mm(self.feature_list[i][index], self.feature_list[i][index].T).to("cuda:0")
                     self.feature_mat.append(feature_mat)
+                    for index in self.feature_list[i].keys():
+
+                        module.lora_q.lora_A.data[:,index*module.step:(index+1)*module.step].copy_(module.lora_q.lora_A.data[:,index*module.step:(index+1)*module.step] - torch.mm(module.lora_q.lora_A.data[:,index*module.step:(index+1)*module.step], feature_mat[index]))
+                        module.lora_v.lora_A.data[:,index*module.step:(index+1)*module.step].copy_(module.lora_v.lora_A.data[:,index*module.step:(index+1)*module.step] - torch.mm(module.lora_v.lora_A.data[:,index*module.step:(index+1)*module.step], feature_mat[index]))
+                    module.lora_q.lora_A.data /= (math.sqrt(3) * module.lora_q.lora_A.data.norm(dim=1,keepdim=True))
+                    module.lora_v.lora_A.data /= (math.sqrt(3) * module.lora_v.lora_A.data.norm(dim=1,keepdim=True))
                     i += 1
 
             self.feature_trans_mat = []
@@ -185,41 +207,17 @@ class GainLoRA_InfLoRA_Trainer(Seq2SeqTrainer):
             self.feature_trans_mat.append(feature_trans_mat)
             self.feature_trans_mat.append(torch.mm(self.feature_trans_list[1], self.feature_trans_list[1].T))
             feature_trans_mat = {}
-            try:
-                for index in self.feature_trans_list[2].keys():
-                    feature_trans_mat[index] = torch.mm(self.feature_trans_list[2][index], self.feature_trans_list[2][index].T)
-            except:
-                ipdb.set_trace()
-                raise Exception
-            # ipdb.set_trace()
+            for index in self.feature_trans_list[2].keys():
+                feature_trans_mat[index] = torch.mm(self.feature_trans_list[2][index], self.feature_trans_list[2][index].T)
             self.feature_trans_mat.append(feature_trans_mat)
 
-            i = 0
-            for module in self.model.modules():
-                if hasattr(module, 'get_feature'):
-                    for index in module.matrix.keys():
-                        cur_matrix = module.matrix[index]
-                        cur_matrix = cur_matrix - torch.mm(self.feature_mat[i][index],cur_matrix)
-                        U, S, V = torch.linalg.svd(cur_matrix)
-                        module.lora_q.lora_A.data[:,index*module.step:(index+1)*module.step].copy_(U[:,:module.lora_q.r].T)
-                        module.lora_v.lora_A.data[:,index*module.step:(index+1)*module.step].copy_(U[:,:module.lora_v.r].T)
-                        module.matrix[index].zero_()
-                        module.n_matrix[index] = 0
-                    module.lora_q.lora_A.data /= math.sqrt(module.chunk*3)
-                    module.lora_v.lora_A.data /= math.sqrt(module.chunk*3)
-                    i += 1
-                    module.get_feature=False
-                    module.stage = 0
 
             module = self.model.encoder
             pre_norm = module.prompt_key.detach().norm()
             for index in module.matrix_trans_3.keys():
                 cur_trans_matrix = module.matrix_trans_3[index]
-                try:
-                    cur_trans_matrix = cur_trans_matrix - torch.mm(self.feature_trans_mat[2][index],cur_trans_matrix)
-                except:
-                    ipdb.set_trace()
-                    raise Exception
+                cur_trans_matrix = torch.randn_like(cur_trans_matrix)
+                cur_trans_matrix = cur_trans_matrix - torch.mm(self.feature_trans_mat[2][index],cur_trans_matrix)
                 U, S, V = torch.linalg.svd(cur_trans_matrix)
                 module.prompt_key.data[:,index*module.step:(index+1)*module.step].copy_(U[:,:1].T)
                 module.matrix_trans_1[index].zero_()
@@ -230,6 +228,7 @@ class GainLoRA_InfLoRA_Trainer(Seq2SeqTrainer):
             module.prompt_key.data *= pre_norm
             module.get_trans_feature=False
             module.stage_trans=0
+
         return
 
     def get_repsentation(self):
@@ -1342,7 +1341,18 @@ class GainLoRA_InfLoRA_Trainer(Seq2SeqTrainer):
 
 
                     if self._cur_task:
-
+                        # i = 0
+                        # for module in self.model.modules():
+                        #     if hasattr(module, 'get_feature'):
+                        #         new_weight_q = deepcopy(module.lora_q.lora_A.data.float())
+                        #         new_weight_v = deepcopy(module.lora_v.lora_A.data.float())
+                        #         for index in self.feature_mat[i].keys():
+                        #             new_weight_q[:,index*module.step:(index+1)*module.step] = module.lora_q.lora_A[:,index*module.step:(index+1)*module.step].data.float() - torch.mm(module.lora_q.lora_A[:,index*module.step:(index+1)*module.step].data.float() - old_params_q[i][:,index*module.step:(index+1)*module.step].float(), self.feature_mat[i][index])
+                        #             new_weight_v[:,index*module.step:(index+1)*module.step] = module.lora_v.lora_A[:,index*module.step:(index+1)*module.step].data.float() - torch.mm(module.lora_v.lora_A[:,index*module.step:(index+1)*module.step].data.float() - old_params_v[i][:,index*module.step:(index+1)*module.step].float(), self.feature_mat[i][index])
+                        #         module.lora_q.lora_A.data.copy_(new_weight_q)
+                        #         module.lora_v.lora_A.data.copy_(new_weight_v)
+                        #         i += 1
+                        
                         new_trans_input_0 = deepcopy(self.model.encoder.trans_input[0].weight.detach())
                         new_trans_input_1 = deepcopy(self.model.encoder.trans_input[2].weight.detach())
                         new_trans_input_0norm = new_trans_input_0.norm(dim=1, keepdim=True)
@@ -1351,6 +1361,8 @@ class GainLoRA_InfLoRA_Trainer(Seq2SeqTrainer):
                         new_prompt_key = deepcopy(self.model.encoder.prompt_key.detach())
                         new_prompt_key_norm = new_prompt_key.norm(dim=1, keepdim=True)
                         for index in self.feature_trans_mat[0].keys():
+                            # ipdb.set_trace()
+                            # print(self.model.encoder.trans_input[0].weight.detach()[:,index*self.model.encoder.step:(index+1)*self.model.encoder.step]-old_trans_input_0[:,index*self.model.encoder.step:(index+1)*self.model.encoder.step])
                             new_trans_input_0[:,index*self.model.encoder.step:(index+1)*self.model.encoder.step] = self.model.encoder.trans_input[0].weight.detach()[:,index*self.model.encoder.step:(index+1)*self.model.encoder.step] - torch.mm(self.model.encoder.trans_input[0].weight.detach()[:,index*self.model.encoder.step:(index+1)*self.model.encoder.step]-old_trans_input_0[:,index*self.model.encoder.step:(index+1)*self.model.encoder.step], self.feature_trans_mat[0][index])
                             new_prompt_key[:,index*self.model.encoder.step:(index+1)*self.model.encoder.step] = self.model.encoder.prompt_key.detach()[:,index*self.model.encoder.step:(index+1)*self.model.encoder.step] - torch.mm(self.model.encoder.prompt_key.detach()[:,index*self.model.encoder.step:(index+1)*self.model.encoder.step]-old_prompt_key[:,index*self.model.encoder.step:(index+1)*self.model.encoder.step], self.feature_trans_mat[2][index])
                         new_trans_input_1 = self.model.encoder.trans_input[2].weight.detach() - torch.mm(self.model.encoder.trans_input[2].weight.detach()-old_trans_input_1, self.feature_trans_mat[1])
