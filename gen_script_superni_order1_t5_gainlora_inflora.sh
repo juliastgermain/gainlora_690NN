@@ -732,7 +732,7 @@ CUDA_VISIBLE_DEVICES=$1 python src/run_t5.py \
    --lora_alpha 32 \
    --lora_dropout 0.0 \
    --add_instruction_replay \
-   --data_replay_freq 1 \
+   --data_replay_freq -1 \
    --replay_after_n_epoch 0 \
    --kl_ratio 0.5 \
    --attn_temperature 1 \
