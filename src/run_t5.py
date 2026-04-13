@@ -428,7 +428,8 @@ def main():
         # cache_dir=data_cache_dir,  # for debug, change dataset size, otherwise open it
         max_num_instances_per_task=data_args.max_num_instances_per_task,
         max_num_instances_per_eval_task=data_args.max_num_instances_per_eval_task,
-        num_examples=data_args.num_examples
+        num_examples=data_args.num_examples,
+        trust_remote_code=True
     )
     raw_datasets.cleanup_cache_files()
 
@@ -658,7 +659,8 @@ def main():
                     cache_dir=data_cache_dir,  # for debug, change dataset size, otherwise open it
                     max_num_instances_per_task=data_args.max_num_instances_per_task,
                     max_num_instances_per_eval_task=data_args.max_num_instances_per_eval_task,
-                    num_examples=data_args.num_examples)
+                    num_examples=data_args.num_examples,
+                    trust_remote_code=True)
 
                 replay_dataset_dict[task_order[idx]] = raw_datasets_gen["train"]
                 print(raw_datasets_gen)
