@@ -101,14 +101,19 @@ def run_phase3_gainlora(task_0, task_1, epochs=5, train_batch_size=2, grad_accum
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
     model = build_model(MODEL_NAME, lora_r=lora_r, lora_alpha=lora_alpha,
                         lora_dropout=lora_dropout, gate_hidden_dim=gate_hidden_dim).cuda()
-    # Task 0
-    print(f"\n--- Train task 0: {task_0} ---")
-    enable_gating(model, False)
+    # Task 0 — gate is ON from the start so it learns task-0 routing.
+    # Without this, the gate never sees task-0 inputs and can't route to
+    # task-0's LoRA at eval time (this was the Phase 3 v1 failure mode).
+    print(f"\n--- Train task 0: {task_0} (gating ON) ---")
+    enable_gating(model, True)
+    def task0_params():
+        return [{"params": trainable_lora_params(model), "lr": learning_rate_lora},
+                {"params": gating_params(model), "lr": learning_rate_gate}]
     _train_one_task(model, tokenizer, task_0, epochs=epochs, train_batch_size=train_batch_size,
                     grad_accum_steps=grad_accum_steps, learning_rate=learning_rate_lora,
                     max_source_length=max_source_length, max_target_length=max_target_length,
                     max_train_samples=max_train_samples, log_every=log_every,
-                    optimizer_param_groups=lambda: trainable_lora_params(model))
+                    optimizer_param_groups=task0_params)
     _free()
     print(f"\n--- Eval task 0 after task-0 training ---")
     eval_t0_after_t0 = evaluate_task(model, task_0, tokenizer, max_eval_samples=max_eval_samples,
