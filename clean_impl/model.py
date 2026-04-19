@@ -55,36 +55,35 @@ def _is_t5_attention(module):
     return all(hasattr(module, attr) for attr in ("q", "k", "v", "o"))
 
 class GainLoRAT5(T5ForConditionalGeneration):
+    def _compute_and_set_gate(self, input_ids, attention_mask):
+        """Compute gate weights from input embeddings (not encoder output).
+        This matches the reference repo which uses avg_inputs_embeds, and
+        solves the chicken-and-egg problem: gate runs BEFORE encoder, so
+        both encoder and decoder attention layers are properly gated."""
+        input_embeds = self.shared(input_ids)  # [batch, seq, d_model]
+        # Pool embeddings the same way we pooled encoder hidden states
+        pooled = pool_encoder_hidden(input_embeds, attention_mask)
+        gate_weights = self.gating(pooled)
+        set_gate_weights(self, gate_weights)
+
     def forward(self, input_ids=None, attention_mask=None, labels=None,
                 decoder_input_ids=None, decoder_attention_mask=None,
                 encoder_outputs=None, **kwargs):
         if (self._gating_enabled and self._active_task_only is None
-                and encoder_outputs is None and input_ids is not None):
-            # Clear stale gate weights before encoder runs, so encoder
-            # layers use the ungated path. Only decoder layers will be gated.
-            set_gate_weights(self, None)
-            enc_out = self.encoder(input_ids=input_ids, attention_mask=attention_mask, return_dict=True)
-            pooled = pool_encoder_hidden(enc_out.last_hidden_state, attention_mask)
-            gate_weights = self.gating(pooled)
-            set_gate_weights(self, gate_weights)
-            encoder_outputs = enc_out
+                and input_ids is not None):
+            # Compute gate from embeddings BEFORE encoder runs.
+            # This way both encoder and decoder are properly gated.
+            self._compute_and_set_gate(input_ids, attention_mask)
         return super().forward(
             input_ids=input_ids, attention_mask=attention_mask, labels=labels,
             decoder_input_ids=decoder_input_ids, decoder_attention_mask=decoder_attention_mask,
             encoder_outputs=encoder_outputs, **kwargs)
 
     def generate(self, input_ids=None, attention_mask=None, **kwargs):
-        """Override generate to compute gate weights before generation.
-        HF's generate() calls encoder directly, bypassing our forward().
-        We pre-compute gate weights here so decoder layers see them."""
+        """Compute gate weights before generation."""
         if (self._gating_enabled and self._active_task_only is None
-                and input_ids is not None and 'encoder_outputs' not in kwargs):
-            set_gate_weights(self, None)
-            enc_out = self.encoder(input_ids=input_ids, attention_mask=attention_mask, return_dict=True)
-            pooled = pool_encoder_hidden(enc_out.last_hidden_state, attention_mask)
-            gate_weights = self.gating(pooled)
-            set_gate_weights(self, gate_weights)
-            kwargs['encoder_outputs'] = enc_out
+                and input_ids is not None):
+            self._compute_and_set_gate(input_ids, attention_mask)
         return super().generate(input_ids=input_ids, attention_mask=attention_mask, **kwargs)
 
 def attach_loras_and_gate(model, lora_r=4, lora_alpha=32, lora_dropout=0.0, gate_hidden_dim=100):
