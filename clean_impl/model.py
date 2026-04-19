@@ -39,9 +39,15 @@ class MultiTaskLinearWithLoRA(nn.Module):
         n_tasks = self._gate_weights.size(1)
         if n_tasks != len(self.loras):
             raise RuntimeError(f"gate has {n_tasks} tasks but layer has {len(self.loras)} LoRAs")
+        # Softmax across tasks (dim=1) so weights sum to 1 per dimension.
+        # Without this, the new task's gate can grow unboundedly large and
+        # dominate even on old-task inputs. The reference repo uses attention-
+        # style normalization (attn_temperature parameter); softmax is the
+        # clean equivalent.
+        normed_gates = torch.softmax(self._gate_weights, dim=1)
         out = base_out
         for t, lora in enumerate(self.loras):
-            weight = self._gate_weights[:, t, :].unsqueeze(1)
+            weight = normed_gates[:, t, :].unsqueeze(1)
             out = out + lora(x) * weight
         return out
 
