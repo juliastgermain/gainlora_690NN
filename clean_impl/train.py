@@ -98,7 +98,7 @@ def run_phase3_gainlora(task_0, task_1, epochs=5, train_batch_size=2, grad_accum
     print(f"\n{'='*60}\nGAINLORA FLOW: {task_0} -> {task_1}\n{'='*60}")
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
     model = build_model(MODEL_NAME, lora_r=lora_r, lora_alpha=lora_alpha,
-                        lora_dropout=lora_dropout, gate_hidden_dim=gate_hidden_dim).cuda()
+                        lora_dropout=lora_dropout, router_hidden_dim=gate_hidden_dim).cuda()
     # Task 0 — gate is ON from the start so it learns task-0 routing.
     # Without this, the gate never sees task-0 inputs and can't route to
     # task-0's LoRA at eval time (this was the Phase 3 v1 failure mode).
