@@ -87,7 +87,7 @@ class TaskRouter(nn.Module):
         # Old tasks' MLPs + keys
         old_weights = []
         for i in range(self.old_keys.size(0)):
-            old_key = self.old_keys[i:i+1].unsqueeze(0).expand(B, -1, -1)  # [B, 1, D]
+            old_key = self.old_keys[i:i+1].unsqueeze(0).expand(B, 1, -1)   # [B, 1, D]
             old_out = self.old_mlps[i](pooled_embeds)                        # [B, 1, D]
             w = self._cosine_sim_weight(old_key, old_out)                    # [B, 1, 1]
             old_weights.append(w)
@@ -117,10 +117,10 @@ class TaskRouter(nn.Module):
         frozen_mlp = frozen_mlp.to(device)
 
         if self.old_keys is None:
-            self.old_keys = nn.Parameter(frozen_key.unsqueeze(0), requires_grad=False)  # [1, D]
+            self.old_keys = nn.Parameter(frozen_key, requires_grad=False)  # [1, D]
             self.old_mlps = nn.ModuleList([frozen_mlp])
         else:
-            new_keys = torch.cat([self.old_keys.data, frozen_key.unsqueeze(0)], dim=0)
+            new_keys = torch.cat([self.old_keys.data, frozen_key], dim=0)
             self.old_keys = nn.Parameter(new_keys, requires_grad=False)
             self.old_mlps.append(frozen_mlp)
 
