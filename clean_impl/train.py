@@ -84,12 +84,10 @@ def _train_one_task(model, tokenizer, task_name, epochs, train_batch_size, grad_
     return avg
 
 def _make_freeze_old_gate_mask(model, n_old_tasks):
+    """No longer needed — old task components are separate and frozen.
+    Kept as a no-op for compatibility."""
     def _mask():
-        with torch.no_grad():
-            if model.gating.input_linear.grad is not None:
-                model.gating.input_linear.grad[:n_old_tasks] = 0.0
-            if model.gating.output_linear.grad is not None:
-                model.gating.output_linear.grad[:n_old_tasks] = 0.0
+        pass
     return _mask
 
 def run_phase3_gainlora(task_0, task_1, epochs=5, train_batch_size=2, grad_accum_steps=16,
