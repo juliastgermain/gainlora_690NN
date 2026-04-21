@@ -132,8 +132,8 @@ def _train_one_task(model, tokenizer, task_name, epochs, train_batch_size,
 
 def run_phase3_gainlora(
     task_0, task_1,
-    epochs=5, train_batch_size=2, grad_accum_steps=16,
-    learning_rate_lora=3e-4, learning_rate_gate=1e-3,
+    epochs=10, train_batch_size=2, grad_accum_steps=16,
+    learning_rate_lora=3e-4, learning_rate_gate=1e-4,
     lora_r=4, lora_alpha=32, lora_dropout=0.0, gate_hidden_dim=100,
     max_source_length=512, max_target_length=50,
     max_train_samples=200, max_eval_samples=30, log_every=10,
@@ -176,7 +176,7 @@ def run_phase3_gainlora(
     gpm_ds = SuperNITaskDataset(
         data_dir=DATA_DIR, task_name=task_0, split="train",
         tokenizer=tokenizer, max_source_length=max_source_length,
-        max_target_length=max_target_length, max_num_instances=max_train_samples)
+        max_target_length=max_target_length, max_num_instances=400)
     gpm_loader = DataLoader(gpm_ds, batch_size=4, shuffle=False)
     activations = gpm.collect_activations(model, gpm_loader)
     gpm.update_bases(activations)

@@ -39,10 +39,13 @@ class TaskRouter(nn.Module):
         self.old_keys = None   # nn.Parameter [n_old, d_model], frozen
         self.old_mlps = None   # nn.ModuleList of frozen nn.Sequential
         self.n_tasks = 1
-
     def _v_shaped(self, scores):
+        # Increased multiplier from 4.0 to 10.0 for sharper task separation
+        return torch.abs(2.0 * torch.sigmoid(scores * 10.0) - 1.0)
         """f(b) = |2*sigmoid(4b) - 1|  —  range [0,1], paper eq 8."""
-        return torch.abs(2.0 * torch.sigmoid(scores * 4.0) - 1.0)
+        #return torch.abs(2.0 * torch.sigmoid(scores * 4.0) - 1.0)
+
+
 
     def _cosine_weight(self, key, mlp_out):
         """Cosine similarity + V-shaped activation -> [B, 1, 1]."""
@@ -50,6 +53,7 @@ class TaskRouter(nn.Module):
         out_n = mlp_out / (mlp_out.norm(dim=-1, keepdim=True) + 1e-8)
         score = (key_n * out_n).sum(dim=-1, keepdim=True)
         return self._v_shaped(score)
+    
 
     def _run_mlp(self, mlp, pooled):
         """Run MLP, return (final_output, intermediate_after_first_layer).

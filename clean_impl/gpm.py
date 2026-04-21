@@ -51,45 +51,45 @@ class GPM:
             "gate_hidden": torch.cat(gate_hiddens, dim=0),
             "gate_output": torch.cat(gate_outputs, dim=0),
         }
-
     @torch.no_grad()
     def update_bases(self, activations: dict):
-        """Extend orthonormal bases via SVD on activation residuals."""
         for key in ["gate_input", "gate_hidden", "gate_output"]:
-            A = activations[key].T  # [feature_dim, N]
-
+            A = activations[key].T  # [dim, N]
+            
             if key not in self.bases or self.bases[key] is None:
                 residual = A
                 old_explained = 0.0
             else:
                 M = self.bases[key]
+                # Project out what we already know
                 residual = A - M @ (M.T @ A)
                 old_explained = ((M.T @ A) ** 2).sum()
 
+            # We need a very high threshold (0.999) to prevent cumulative leakage
+            target = 0.999 * (A ** 2).sum()
+            
             cov = residual @ residual.T
             U, S, _ = torch.linalg.svd(cov)
-            total_var = S.sum()
-            if total_var < 1e-10:
-                print(f"  GPM [{key}]: near-zero variance, skipping")
-                continue
-
-            full_var = (A ** 2).sum()
-            target = self.threshold * full_var
             cumvar = torch.cumsum(S, dim=0)
-            n_new = min(5, len(S))  # fallback
+            
+            n_new = 0
             for i in range(len(S)):
                 if cumvar[i] + old_explained >= target:
                     n_new = i + 1
                     break
+            
+            # If target not met (rare), take at least some bases if variance exists
+            if n_new == 0 and S[0] > 1e-7: n_new = min(20, len(S))
 
-            new_bases = U[:, :n_new]
+            new_v = U[:, :n_new]
             if key not in self.bases or self.bases[key] is None:
-                self.bases[key] = new_bases
+                self.bases[key] = new_v
             else:
-                self.bases[key] = torch.cat([self.bases[key], new_bases], dim=1)
+                self.bases[key] = torch.cat([self.bases[key], new_v], dim=1)
+            
+            print(f"  GPM [{key}]: Added {n_new} bases (Total: {self.bases[key].size(1)})")
 
-            print(f"  GPM [{key}]: +{n_new} bases "
-                  f"(total {self.bases[key].size(1)}, dim={self.bases[key].size(0)})")
+    
 
     @torch.no_grad()
     def project_init_key(self, model):
