@@ -66,7 +66,7 @@ class GPM:
                 old_explained = ((M.T @ A) ** 2).sum()
 
             # We need a very high threshold (0.999) to prevent cumulative leakage
-            target = 0.999 * (A ** 2).sum()
+            target = 0.97 * (A ** 2).sum()
             
             cov = residual @ residual.T
             U, S, _ = torch.linalg.svd(cov)
