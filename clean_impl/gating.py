@@ -1,143 +1,121 @@
 """
-TaskRouter — matches the GainLoRA paper's routing mechanism exactly.
+Gating module — exact implementation of paper Section 3.1 and Appendix B.3.
 
-Each task t has:
-  - current_mlp: two-layer MLP (G_{t,1}, G_{t,2})  [trainable for current task]
-  - current_key: prompt_key vector G_{t,3}           [trainable for current task]
+Per-task gating module g_i(x) (paper eq 3):
+  p_{i,0} = p0 = Pool(Token(x))           [B, d]         — shared input
+  p_{i,1} = σ(G_{i,1} · p_{i,0})          [B, h=100]     — G_{i,1} ∈ R^{100×1024}
+  p_{i,2} = σ(G_{i,2} · p_{i,1})          [B, d=1024]    — G_{i,2} ∈ R^{1024×100}
+  g_i(x)  = f(G_{i,3} · p_{i,2})          scalar [B, 1]  — G_{i,3} ∈ R^{1×1024}
 
-Routing weight for task t on input x:
-  p0      = Pool(Embed(x))                    [B, 1, D]
-  p_{t,1} = SiLU(G_{t,1}(p0))                [B, 1, hidden]
-  p_{t,2} = SiLU(G_{t,2}(p_{t,1}))           [B, 1, D]
-  score   = cosine(key_t, p_{t,2})            [B, 1, 1]
-  weight  = |2*sigmoid(4*score) - 1|          [B, 1, 1]  (paper eq 8)
+where f(b) = |2·sigmoid(b) − 1|  (paper eq 8), which satisfies f(0)=0, range [0,1].
 
-add_task():
-  - Freezes current key+MLP (becomes old task's components)
-  - Creates NEW MLP as a COPY of current MLP (paper eq 9, preserves shared structure)
-  - Creates NEW key with random init (will be projected by GPM eq 10)
+NOTE: G_{i,3} maps to a SCALAR — NOT cosine similarity. This is the critical
+difference from the previous implementation. The paper's final layer is a linear
+dot product, not a cosine distance with a learned key vector.
+
+Initialization (paper eq 9):
+  When adding task t, Init(G_{t,1}) ← G_{t-1,1}, Init(G_{t,2}) ← G_{t-1,2}
+  Init(G_{t,3}): random, then projected ⊥ subspace of old p_{t,2} activations (eq 10).
+
+MultiTaskRouter manages all per-task gating modules.
 """
 import torch
 from torch import nn
 
 
-class TaskRouter(nn.Module):
+def _f(score: torch.Tensor) -> torch.Tensor:
+    """Paper eq 8: f(b) = |2·sigmoid(b) − 1|.  Maps R→[0,1], f(0)=0."""
+    return torch.abs(2.0 * torch.sigmoid(score) - 1.0)
+
+
+class SingleTaskGate(nn.Module):
+    """
+    Gating module for ONE task.
+    Appendix B.3: G_{i,1} ∈ R^{100×d}, G_{i,2} ∈ R^{d×100}, G_{i,3} ∈ R^{1×d}
+    """
+    def __init__(self, d_model: int, hidden_dim: int = 100):
+        super().__init__()
+        self.G1 = nn.Linear(d_model, hidden_dim, bias=False)  # [h, d]
+        self.G2 = nn.Linear(hidden_dim, d_model, bias=False)  # [d, h]
+        self.G3 = nn.Linear(d_model, 1, bias=False)           # [1, d] → scalar
+        self.activation = nn.SiLU()
+
+    def forward(self, p0: torch.Tensor) -> torch.Tensor:
+        """p0: [B, d] → scalar weight [B, 1]."""
+        p1 = self.activation(self.G1(p0))   # [B, h]
+        p2 = self.activation(self.G2(p1))   # [B, d]
+        return _f(self.G3(p2))              # [B, 1]
+
+    def get_activations(self, p0: torch.Tensor):
+        """Return (p1, p2) for GPM activation collection."""
+        p1 = self.activation(self.G1(p0))
+        p2 = self.activation(self.G2(p1))
+        return p1, p2
+
+
+class MultiTaskRouter(nn.Module):
+    """
+    Manages one SingleTaskGate per task.
+
+    forward(p0) → [B, n_tasks, 1]  scalar weight per task.
+    Ordering: [old_0, old_1, ..., current_task]
+    """
     def __init__(self, d_model: int, hidden_dim: int = 100):
         super().__init__()
         self.d_model = d_model
         self.hidden_dim = hidden_dim
-
-        self.current_mlp = nn.Sequential(
-            nn.Linear(d_model, hidden_dim, bias=False),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, d_model, bias=False),
-            nn.SiLU(),
-        )
-        self.current_key = nn.Parameter(torch.empty(1, d_model))
-        nn.init.uniform_(self.current_key, -1, 1)
-
-        self.old_keys = None   # nn.Parameter [n_old, d_model], frozen
-        self.old_mlps = None   # nn.ModuleList of frozen nn.Sequential
+        self.current_gate = SingleTaskGate(d_model, hidden_dim)
+        self.old_gates = nn.ModuleList()   # all frozen
         self.n_tasks = 1
-    def _v_shaped(self, scores):
-        # Increased multiplier from 4.0 to 10.0 for sharper task separation
-        return torch.abs(2.0 * torch.sigmoid(scores * 10.0) - 1.0)
-        """f(b) = |2*sigmoid(4b) - 1|  —  range [0,1], paper eq 8."""
-        #return torch.abs(2.0 * torch.sigmoid(scores * 4.0) - 1.0)
 
+    def forward(self, p0: torch.Tensor) -> torch.Tensor:
+        """p0: [B, d] → [B, n_tasks, 1]."""
+        current_w = self.current_gate(p0)  # [B, 1]
 
+        if len(self.old_gates) == 0:
+            return current_w.unsqueeze(1)  # [B, 1, 1]
 
-    def _cosine_weight(self, key, mlp_out):
-        """Cosine similarity + V-shaped activation -> [B, 1, 1]."""
-        key_n = key / (key.norm(dim=-1, keepdim=True) + 1e-8)
-        out_n = mlp_out / (mlp_out.norm(dim=-1, keepdim=True) + 1e-8)
-        score = (key_n * out_n).sum(dim=-1, keepdim=True)
-        return self._v_shaped(score)
-    
+        old_ws = [g(p0) for g in self.old_gates]   # list of [B, 1]
+        all_ws = old_ws + [current_w]               # old first, current last
+        return torch.stack(all_ws, dim=1)           # [B, n_tasks, 1]
 
-    def _run_mlp(self, mlp, pooled):
-        """Run MLP, return (final_output, intermediate_after_first_layer).
-        pooled: [B, 1, D]"""
-        medium = mlp[1](mlp[0](pooled))   # [B, 1, hidden]
-        output = mlp[3](mlp[2](medium))   # [B, 1, D]
-        return output, medium
-
-    def forward(self, pooled: torch.Tensor) -> torch.Tensor:
+    def add_task(self) -> int:
         """
-        pooled: [B, 1, D]  (masked-mean of input embeddings)
-        Returns: [B, n_tasks, 1]  scalar routing weight per task.
-        Ordering: [old_0, old_1, ..., current]
+        Freeze current gate → move to old_gates.
+        Create new gate:
+          - G1, G2 copied from current (paper eq 9)
+          - G3 random-initialized (GPM will project it before training, paper eq 10)
+        Returns index of the new task.
         """
-        B = pooled.size(0)
-        current_out, _ = self._run_mlp(self.current_mlp, pooled)
-        current_key = self.current_key.unsqueeze(0).expand(B, 1, -1)
-        current_w = self._cosine_weight(current_key, current_out)  # [B, 1, 1]
+        device = next(self.current_gate.parameters()).device
 
-        if self.old_keys is None:
-            return current_w  # [B, 1, 1]
-
-        old_weights = []
-        for i in range(self.old_keys.size(0)):
-            old_key = self.old_keys[i:i+1].unsqueeze(0).expand(B, 1, -1)
-            old_out, _ = self._run_mlp(self.old_mlps[i], pooled)
-            old_weights.append(self._cosine_weight(old_key, old_out))
-
-        return torch.cat(old_weights + [current_w], dim=1)  # [B, n_tasks, 1]
-
-    def add_task(self):
-        """
-        Freeze current key+MLP. Create new key+MLP for next task.
-        New MLP is a COPY of current (paper eq 9).
-        New key is random (GPM will project it in eq 10).
-        Returns index of new task.
-        """
-        device = self.current_key.device
-
-        # Freeze current MLP
-        frozen_mlp = nn.Sequential(
-            nn.Linear(self.d_model, self.hidden_dim, bias=False), nn.SiLU(),
-            nn.Linear(self.hidden_dim, self.d_model, bias=False), nn.SiLU(),
-        )
-        frozen_mlp.load_state_dict(self.current_mlp.state_dict())
-        for p in frozen_mlp.parameters():
+        # Freeze
+        for p in self.current_gate.parameters():
             p.requires_grad = False
-        frozen_mlp = frozen_mlp.to(device)
+        self.old_gates.append(self.current_gate)
 
-        # Freeze current key
-        frozen_key = self.current_key.data.clone()  # [1, D]
-
-        # Store
-        if self.old_keys is None:
-            self.old_keys = nn.Parameter(frozen_key, requires_grad=False)
-            self.old_mlps = nn.ModuleList([frozen_mlp])
-        else:
-            self.old_keys = nn.Parameter(
-                torch.cat([self.old_keys.data, frozen_key], dim=0), requires_grad=False)
-            self.old_mlps.append(frozen_mlp)
-
-        # New MLP: COPY of current (paper eq 9)
-        new_mlp = nn.Sequential(
-            nn.Linear(self.d_model, self.hidden_dim, bias=False), nn.SiLU(),
-            nn.Linear(self.hidden_dim, self.d_model, bias=False), nn.SiLU(),
-        )
-        new_mlp.load_state_dict(self.current_mlp.state_dict())
-        self.current_mlp = new_mlp.to(device)
-
-        # New key: fresh random (projected by GPM eq 10 before training)
-        self.current_key = nn.Parameter(torch.empty(1, self.d_model, device=device))
-        nn.init.uniform_(self.current_key, -1, 1)
+        # New gate
+        new_gate = SingleTaskGate(self.d_model, self.hidden_dim).to(device)
+        # Paper eq 9: copy G1 and G2 from previous gate
+        new_gate.G1.weight.data.copy_(self.old_gates[-1].G1.weight.data)
+        new_gate.G2.weight.data.copy_(self.old_gates[-1].G2.weight.data)
+        # G3: leave as random init; GPM will project it in project_init_G3()
+        self.current_gate = new_gate
 
         self.n_tasks += 1
-        return self.n_tasks - 1  # index of newly added task
+        return self.n_tasks - 1   # index of newly added task
 
     def get_trainable_params(self):
-        """Only current task's key + MLP are trainable."""
-        return [self.current_key] + list(self.current_mlp.parameters())
+        """Only current task's gate is trainable."""
+        return list(self.current_gate.parameters())
 
 
-def pool_encoder_hidden(hidden, attention_mask):
-    """Masked mean pool -> [B, 1, D] (keepdim so it's compatible with MLP input)."""
+def pool_encoder_hidden(hidden: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+    """
+    Masked mean pooling → [B, d_model].
+    Note: returns 2D (no keepdim), matching the gating module's expected input.
+    """
     mask = attention_mask.unsqueeze(-1).to(hidden.dtype)
-    pooled = (mask * hidden).sum(dim=1, keepdim=True)
-    counts = mask.sum(dim=1, keepdim=True).clamp(min=1.0)
-    return pooled / counts
+    pooled = (mask * hidden).sum(dim=1)
+    counts = mask.sum(dim=1).clamp(min=1.0)
+    return pooled / counts   # [B, d]

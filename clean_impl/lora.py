@@ -1,4 +1,3 @@
-"""Standard low-rank adapter: y = (dropout(x) @ A^T @ B^T) * scaling."""
 import math
 import torch
 from torch import nn

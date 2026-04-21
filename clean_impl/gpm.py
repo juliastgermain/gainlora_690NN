@@ -1,142 +1,164 @@
 """
-Gradient Projection Memory (GPM) for the TaskRouter.
+Gradient Projection Memory — paper Appendix A.1.
 
-Collects three activation sets after training each task:
-  gate_input:  p0       pooled embeddings    [N, D]  -> projects G_{t,1} grads
-  gate_hidden: p_{t,1}  after 1st MLP layer  [N, H]  -> projects G_{t,2} grads
-  gate_output: p_{t,2}  after 2nd MLP layer  [N, D]  -> projects key grads + init projection
+Collects inputs to each layer of the current task's gating module:
+  M_{t,1}: inputs to G_{t,1} = p0        [N, d=1024]
+  M_{t,2}: inputs to G_{t,2} = p_{t,1}  [N, h=100]
+  M_{t,3}: inputs to G_{t,3} = p_{t,2}  [N, d=1024]
 
-Three operations:
-  1. collect_activations() — forward pass, cache activations
-  2. update_bases()        — SVD on residual to extend orthonormal bases
-  3. project_init_key()    — project new key ⊥ old output subspace (paper eq 10)
-  4. make_projection_hook()— callable that projects all gate grads (paper eq 12)
+SVD criterion (paper eq 16):
+  ||( H^c_{t,l} )_u ||^2_F + || M_{t,l} M_{t,l}^T H_{t,l} ||^2_F  >=  ε_th ||H_{t,l}||^2_F
+
+Three operations exposed:
+  1. collect_activations()    — forward pass, store p0/p1/p2
+  2. update_bases()           — extend orthonormal bases via SVD
+  3. project_init_G3()        — project G_{t,3} ⊥ M_{t,3} (paper eq 10)
+  4. make_projection_hook()   — callable: project ΔG1/ΔG2/ΔG3 before each step (paper eq 12)
 """
 import torch
 from torch.utils.data import DataLoader
 
 
 class GPM:
-    def __init__(self, threshold: float = 0.995):
+    def __init__(self, threshold: float = 0.97):
+        # Paper uses ε_th from the original GPM paper [47]; 0.97 is the GPM default.
+        # Higher = more bases = stronger protection but less room for new task routing.
         self.threshold = threshold
-        self.bases = {}  # keys: gate_input, gate_hidden, gate_output
+        self.bases = {}   # keys: 'M1', 'M2', 'M3'
 
     @torch.no_grad()
     def collect_activations(self, model, dataloader):
-        """Collect p0, p_{t,1}, p_{t,2} from current task's MLP."""
+        """
+        Collect p0, p_{t,1}, p_{t,2} using the current task's gate.
+        Must be called BEFORE add_task() (while current_gate is still task t's gate).
+        """
         model.eval()
-        gate_inputs, gate_hiddens, gate_outputs = [], [], []
+        p0_list, p1_list, p2_list = [], [], []
         from gating import pool_encoder_hidden
 
         for batch in dataloader:
             input_ids = batch["input_ids"].cuda()
             attention_mask = batch["attention_mask"].cuda()
 
-            # p0: pooled input embeddings
+            # p0: masked-mean of token embeddings [B, d]
             embeds = model.shared(input_ids)
-            pooled = pool_encoder_hidden(embeds, attention_mask)  # [B, 1, D]
-            gate_inputs.append(pooled.squeeze(1).cpu().float())
+            p0 = pool_encoder_hidden(embeds, attention_mask)
+            p0_list.append(p0.cpu().float())
 
-            # p_{t,1}: after first linear + SiLU
-            mlp = model.router.current_mlp
-            medium = mlp[1](mlp[0](pooled))   # [B, 1, H]
-            gate_hiddens.append(medium.squeeze(1).cpu().float())
-
-            # p_{t,2}: after second linear + SiLU (MLP final output)
-            output = mlp[3](mlp[2](medium))   # [B, 1, D]
-            gate_outputs.append(output.squeeze(1).cpu().float())
+            # p1, p2: intermediate activations of current gate
+            p1, p2 = model.router.current_gate.get_activations(p0)
+            p1_list.append(p1.cpu().float())
+            p2_list.append(p2.cpu().float())
 
         return {
-            "gate_input":  torch.cat(gate_inputs,  dim=0),
-            "gate_hidden": torch.cat(gate_hiddens, dim=0),
-            "gate_output": torch.cat(gate_outputs, dim=0),
+            "M1": torch.cat(p0_list, dim=0),   # [N, d]  — inputs to G1
+            "M2": torch.cat(p1_list, dim=0),   # [N, h]  — inputs to G2
+            "M3": torch.cat(p2_list, dim=0),   # [N, d]  — inputs to G3
         }
+
     @torch.no_grad()
     def update_bases(self, activations: dict):
-        for key in ["gate_input", "gate_hidden", "gate_output"]:
-            A = activations[key].T  # [dim, N]
-            
+        """
+        Extend orthonormal bases using paper eq 15-16.
+
+        H_{t,l} has shape [dim_l, N] (columns = samples).
+        Criterion: ||(H^c_u)||^2_F + ||M M^T H||^2_F >= ε_th ||H||^2_F
+        """
+        for key in ["M1", "M2", "M3"]:
+            H = activations[key].T   # [dim, N]
+
             if key not in self.bases or self.bases[key] is None:
-                residual = A
+                Hc = H
                 old_explained = 0.0
             else:
-                M = self.bases[key]
-                # Project out what we already know
-                residual = A - M @ (M.T @ A)
-                old_explained = ((M.T @ A) ** 2).sum()
+                M = self.bases[key]                  # [dim, k]
+                proj = M @ (M.T @ H)                 # [dim, N]  — component in old subspace
+                Hc = H - proj                        # paper eq 15: residual
+                old_explained = (proj ** 2).sum().item()
 
-            # We need a very high threshold (0.999) to prevent cumulative leakage
-            target = 0.97 * (A ** 2).sum()
-            
-            cov = residual @ residual.T
+            full_var = (H ** 2).sum().item()
+            target = self.threshold * full_var
+
+            if full_var < 1e-10:
+                print(f"  GPM [{key}]: near-zero variance, skipping")
+                continue
+
+            # SVD on residual covariance (paper: SVD on H^c (H^c)^T)
+            cov = Hc @ Hc.T      # [dim, dim]
             U, S, _ = torch.linalg.svd(cov)
             cumvar = torch.cumsum(S, dim=0)
-            
-            n_new = 0
+
+            # Find minimum u satisfying eq 16
+            n_new = len(S)   # fallback: take all
             for i in range(len(S)):
-                if cumvar[i] + old_explained >= target:
+                if cumvar[i].item() + old_explained >= target:
                     n_new = i + 1
                     break
-            
-            # If target not met (rare), take at least some bases if variance exists
-            if n_new == 0 and S[0] > 1e-7: n_new = min(20, len(S))
 
-            new_v = U[:, :n_new]
+            new_bases = U[:, :n_new]   # [dim, n_new]
+
             if key not in self.bases or self.bases[key] is None:
-                self.bases[key] = new_v
+                self.bases[key] = new_bases
             else:
-                self.bases[key] = torch.cat([self.bases[key], new_v], dim=1)
-            
-            print(f"  GPM [{key}]: Added {n_new} bases (Total: {self.bases[key].size(1)})")
+                self.bases[key] = torch.cat([self.bases[key], new_bases], dim=1)
 
-    
+            print(f"  GPM [{key}]: +{n_new} bases "
+                  f"(total {self.bases[key].size(1)}, feature_dim={self.bases[key].size(0)})")
 
     @torch.no_grad()
-    def project_init_key(self, model):
+    def project_init_G3(self, model):
         """
-        Paper eq 10: project new key ⊥ gate_output subspace so that
-        g_t(x) ≈ 0 for all old-task inputs x before task-t training starts.
+        Paper eq 10: project Init(G_{t,3}) to be ⊥ to M_{t,3}.
+        Ensures g_t(x) = f(0) = 0 for all old-task inputs before task-t training.
+
+        G3.weight shape: [1, d_model]. Bases M3 shape: [d_model, k].
+        Operation: G3 ← G3 - G3 @ M3 @ M3^T
         """
-        if "gate_output" not in self.bases or self.bases["gate_output"] is None:
-            print("  GPM: no gate_output bases yet, skipping key projection")
+        if "M3" not in self.bases or self.bases["M3"] is None:
+            print("  GPM: no M3 bases yet, skipping G3 projection")
             return
-        M = self.bases["gate_output"].to(model.router.current_key.device)  # [D, k]
-        key = model.router.current_key.data  # [1, D]
-        key_t = key.T                         # [D, 1]
-        model.router.current_key.data = (key_t - M @ (M.T @ key_t)).T
-        # Verify
-        key_n = model.router.current_key.data / (model.router.current_key.data.norm() + 1e-8)
-        max_cos = (key_n @ M).abs().max().item()
-        print(f"  GPM: projected init key ⊥ gate_output "
-              f"(max cosine with bases: {max_cos:.2e})")
+
+        M = self.bases["M3"].to(model.router.current_gate.G3.weight.device)   # [d, k]
+        g = model.router.current_gate.G3.weight.data   # [1, d]
+        model.router.current_gate.G3.weight.data = g - g @ M @ M.T
+
+        # Verify: G3 · any_column_of_M should be ~0
+        g_n = model.router.current_gate.G3.weight.data
+        max_cos = (g_n @ M).abs().max().item() / (g_n.norm().item() + 1e-8)
+        print(f"  GPM: projected G3 ⊥ M3  (max |cosine| with bases: {max_cos:.2e}, target ~0)")
 
     def make_projection_hook(self, model):
         """
-        Paper eq 12: before each optimizer.step(), project gradients of
-        G_{t,1}, G_{t,2}, G_{t,3} orthogonal to their respective bases.
+        Paper eq 12: before each optimizer.step(), project ΔG_{t,l} ⊥ M_{t,l}
+        for l ∈ {1, 2, 3}.
+
+        ΔG1.shape = [h, d],   bases M1 [d, k]:  ΔG1 ← ΔG1 - ΔG1 @ M1 @ M1^T
+        ΔG2.shape = [d, h],   bases M2 [h, k]:  ΔG2 ← ΔG2 - ΔG2 @ M2 @ M2^T
+        ΔG3.shape = [1, d],   bases M3 [d, k]:  ΔG3 ← ΔG3 - ΔG3 @ M3 @ M3^T
         """
         def _project():
             with torch.no_grad():
-                # G_{t,1}: weight [hidden, D], bases [D, k]
-                if "gate_input" in self.bases and self.bases["gate_input"] is not None:
-                    w = model.router.current_mlp[0]
-                    if w.weight.grad is not None:
-                        M = self.bases["gate_input"].to(w.weight.grad.device)
-                        g = w.weight.grad   # [H, D]
-                        w.weight.grad = g - g @ M @ M.T
+                gate = model.router.current_gate
 
-                # G_{t,2}: weight [D, hidden], bases [hidden, k]
-                if "gate_hidden" in self.bases and self.bases["gate_hidden"] is not None:
-                    w = model.router.current_mlp[2]
-                    if w.weight.grad is not None:
-                        M = self.bases["gate_hidden"].to(w.weight.grad.device)
-                        g = w.weight.grad   # [D, H]
-                        w.weight.grad = g - g @ M @ M.T
+                # G1: [h, d], bases [d, k]
+                if "M1" in self.bases and self.bases["M1"] is not None:
+                    if gate.G1.weight.grad is not None:
+                        M = self.bases["M1"].to(gate.G1.weight.grad.device)
+                        g = gate.G1.weight.grad   # [h, d]
+                        gate.G1.weight.grad = g - g @ M @ M.T
 
-                # G_{t,3} (key): [1, D], bases [D, k]
-                if "gate_output" in self.bases and self.bases["gate_output"] is not None:
-                    if model.router.current_key.grad is not None:
-                        M = self.bases["gate_output"].to(model.router.current_key.grad.device)
-                        g = model.router.current_key.grad  # [1, D]
-                        model.router.current_key.grad = g - g @ M @ M.T
+                # G2: [d, h], bases [h, k]
+                if "M2" in self.bases and self.bases["M2"] is not None:
+                    if gate.G2.weight.grad is not None:
+                        M = self.bases["M2"].to(gate.G2.weight.grad.device)
+                        g = gate.G2.weight.grad   # [d, h]
+                        gate.G2.weight.grad = g - g @ M @ M.T
+
+                # G3: [1, d], bases [d, k]
+                if "M3" in self.bases and self.bases["M3"] is not None:
+                    if gate.G3.weight.grad is not None:
+                        M = self.bases["M3"].to(gate.G3.weight.grad.device)
+                        g = gate.G3.weight.grad   # [1, d]
+                        gate.G3.weight.grad = g - g @ M @ M.T
+
         return _project

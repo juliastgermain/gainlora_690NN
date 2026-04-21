@@ -1,4 +1,4 @@
-"""Clean SuperNI data loader — no HuggingFace datasets loading scripts."""
+"""Clean SuperNI data loader."""
 import json, random
 from pathlib import Path
 import torch

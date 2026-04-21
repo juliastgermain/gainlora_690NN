@@ -1,18 +1,18 @@
 """
-T5-large + multi-task LoRA + TaskRouter.
+T5-large + multi-task LoRA + MultiTaskRouter.
 
-Each T5 attention's q and v projections get one LoRALayer per task.
-The TaskRouter produces a scalar weight [B, n_tasks, 1] per task.
-Forward: base_out + sum_t(lora_t(x) * weight_t)
+Integration (paper eq 1-2):
+  W_t = Σ_{i=1}^{t} a_i A_i B_i
+  e = (W + W_t) h
 
-Routing is computed from pooled input embeddings BEFORE the encoder runs,
-so BOTH encoder and decoder layers are properly gated.
+where a_i = g_i(x) is a SCALAR in [0,1] produced by the i-th gating module.
+The routing weight shape is [B, n_tasks, 1] — scalar per task per sample.
 """
 import torch
 from torch import nn
 from transformers import T5ForConditionalGeneration
 from lora import LoRALayer
-from gating import TaskRouter, pool_encoder_hidden
+from gating import MultiTaskRouter, pool_encoder_hidden
 
 
 class MultiTaskLinearWithLoRA(nn.Module):
@@ -27,7 +27,7 @@ class MultiTaskLinearWithLoRA(nn.Module):
         self.loras = nn.ModuleList([
             LoRALayer(in_features, out_features, r=r, lora_alpha=alpha, lora_dropout=dropout)
         ])
-        self._routing_weights = None  # [B, n_tasks, 1], set by GainLoRAT5
+        self._routing_weights = None   # [B, n_tasks, 1], scalar per task
         self._active_task_only = None  # int or None
 
     def add_lora(self):
@@ -35,26 +35,27 @@ class MultiTaskLinearWithLoRA(nn.Module):
                              r=self.r, lora_alpha=self.alpha, lora_dropout=self.dropout)
         device = next(self.loras[0].parameters()).device
         new_lora = new_lora.to(device)
-        # Freeze all old LoRAs
         for old in self.loras:
             for p in old.parameters():
                 p.requires_grad = False
         self.loras.append(new_lora)
 
     def forward(self, x):
-        base_out = self.base(x)
+        base_out = self.base(x)   # [B, S, out]
 
         if self._active_task_only is not None:
             return base_out + self.loras[self._active_task_only](x)
 
         if self._routing_weights is None:
-            # Gating off: uniform sum of all LoRAs
+            # Gating off: sum all LoRAs uniformly (used during evaluation with set_active_task=None)
             return base_out + sum(lora(x) for lora in self.loras)
 
-        # Gating on: weighted sum
+        # Gating on: paper eq 1-2, scalar weight per task
+        # _routing_weights: [B, n_tasks, 1]
         out = base_out
         for t, lora in enumerate(self.loras):
-            w = self._routing_weights[:, t, :].unsqueeze(1)  # [B, 1, 1]
+            # weight: [B, 1] → unsqueeze to [B, 1, 1] for broadcast against [B, S, out]
+            w = self._routing_weights[:, t, :].unsqueeze(1)   # [B, 1, 1]
             out = out + lora(x) * w
         return out
 
@@ -66,10 +67,10 @@ def _is_t5_attention(module):
 class GainLoRAT5(T5ForConditionalGeneration):
 
     def _compute_and_set_routing(self, input_ids, attention_mask):
-        """Pool input embeddings, run router, broadcast weights to all layers."""
-        input_embeds = self.shared(input_ids)
-        pooled = pool_encoder_hidden(input_embeds, attention_mask)  # [B, 1, D]
-        weights = self.router(pooled)                               # [B, n_tasks, 1]
+        """Pool input token embeddings, run all gates, set weights on every LoRA layer."""
+        input_embeds = self.shared(input_ids)                            # [B, S, d]
+        p0 = pool_encoder_hidden(input_embeds, attention_mask)           # [B, d]
+        weights = self.router(p0)                                        # [B, n_tasks, 1]
         set_routing_weights(self, weights)
 
     def forward(self, input_ids=None, attention_mask=None, labels=None,
@@ -110,7 +111,7 @@ def attach_loras_and_router(model, lora_r=4, lora_alpha=32, lora_dropout=0.0,
             wrapped.append((name, module.q))
             wrapped.append((name, module.v))
             n_blocks += 1
-    model.router = TaskRouter(d_model=d_model, hidden_dim=router_hidden_dim)
+    model.router = MultiTaskRouter(d_model=d_model, hidden_dim=router_hidden_dim)
     model._wrapped_loras = wrapped
     model._routing_enabled = False
     model._active_task_only = None
@@ -159,4 +160,6 @@ def build_model(model_name="t5-large", lora_r=4, lora_alpha=32,
     print(f"  attached LoRA to {n_blocks} attention blocks (q + v each)")
     print(f"  router hidden_dim={router_hidden_dim}, n_tasks=1")
     print(f"  trainable: {trainable:,} / {total:,}  ({100*trainable/total:.3f}%)")
+    # Paper Appendix B.4: GainLoRA(O-LoRA) T5-Large = 1,385,472 params
+    print(f"  (paper target: 1,385,472)")
     return model
