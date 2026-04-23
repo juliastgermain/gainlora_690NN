@@ -1,28 +1,34 @@
 """
-Sequential safety training — 3 tasks, 6 adapters.
-Tasks: PKU (safety), BBQ (bias), TOFU (privacy).
-Each task: learn adapter (gradient descent) + unlearn adapter (gradient ascent).
-Fixes: separate optimizers, clamped unlearn loss, gradient clipping.
+Sequential GainLoRA training — 6 tasks, 1 adapter each.
+
+Tasks 0,2,4 are LEARN tasks:   gradient descent,  standard cross-entropy loss
+Tasks 1,3,5 are UNLEARN tasks: gradient ascent,   negative cross-entropy loss
+
+The standard GainLoRA model (model.py) is used directly — no dual adapter
+modification needed. Each task gets exactly one LoRA and one gate.
+
+Key experimental finding this setup reveals:
+  Learn tasks (0,2,4) and their paired unlearn tasks (1,3,5) use
+  IDENTICAL input prompts. GPM collects activations from task t and
+  uses them to suppress task t+1's gate — but since the inputs are
+  the same, the unlearn gate is structurally prevented from routing
+  to the inputs it needs to affect. This is GainLoRA's fundamental
+  incompatibility with learn/unlearn paired tasks.
 """
 import gc, time
 import torch
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
+from rouge_score import rouge_scorer
 
-from safety_data import load_all_tasks, make_dataloaders, SafetyDataset
+from safety_data import load_all_tasks, make_dataloaders
 from gpm import GPM
-from safety_model import (
-    build_safety_model, safety_add_task, safety_enable_gating,
-    trainable_learn_params, trainable_unlearn_params,
-    learn_gate_params, unlearn_gate_params,
-    set_active_task_and_adapter, clear_active_task,
-)
-from safety_eval import eval_learn_quality, eval_forget_score, compute_safety_ap_ft
+from model import (build_model, add_task, enable_gating,
+                   trainable_lora_params, gating_params, set_active_task)
 
-MODEL_NAME    = "t5-large"
-UNLEARN_CAP   = 5.0    # clamp unlearn loss — prevents explosion
-UNLEARN_SCALE = 0.1    # unlearn lr = learn_lr * this = 3e-5
+MODEL_NAME  = "t5-large"
+UNLEARN_CAP = 5.0   # clamp gradient ascent loss to prevent explosion
 
 
 def _free():
@@ -30,115 +36,284 @@ def _free():
     torch.cuda.empty_cache()
 
 
-def _infinite(loader):
-    while True:
-        for batch in loader:
-            yield batch
+def _rouge_l(predictions, references):
+    sc = rouge_scorer.RougeScorer(['rougeL'], use_stemmer=True)
+    if not predictions:
+        return 0.0
+    return sum(sc.score(r, p)['rougeL'].fmeasure
+               for p, r in zip(predictions, references)) / len(predictions)
 
 
-def train_safety_task(
-    model, tokenizer,
-    learn_loader, unlearn_loader,
-    epochs, grad_accum_steps, learning_rate,
-    task_name="", gpm_hook=None, log_every=100,
-):
+@torch.no_grad()
+def evaluate_task(model, examples, tokenizer, task_idx,
+                  max_source_length=256, max_target_length=128,
+                  batch_size=8):
     """
-    One task's training loop.
-    Learn and unlearn use completely separate optimizers.
+    Evaluate ROUGE-L on a task's eval examples.
+    Uses only task_idx's adapter (isolation mode).
     """
-    learn_opt = AdamW(
-        trainable_learn_params(model) + learn_gate_params(model),
-        lr=learning_rate)
+    from safety_data import SafetyDataset
+    ds = SafetyDataset(examples, tokenizer,
+                       max_source_length=max_source_length,
+                       max_target_length=max_target_length)
+    loader = DataLoader(ds, batch_size=batch_size, shuffle=False)
 
-    unlearn_opt = None
-    if unlearn_loader is not None:
-        unlearn_opt = AdamW(
-            trainable_unlearn_params(model) + unlearn_gate_params(model),
-            lr=learning_rate * UNLEARN_SCALE)
+    set_active_task(model, task_idx)
+    model.eval()
+    preds, refs = [], []
+    for batch in loader:
+        gen_ids = model.generate(
+            input_ids=batch["input_ids"].cuda(),
+            attention_mask=batch["attention_mask"].cuda(),
+            max_new_tokens=max_target_length, num_beams=1, do_sample=False)
+        preds.extend(tokenizer.batch_decode(gen_ids, skip_special_tokens=True))
+        labels = batch["labels"].clone()
+        labels[labels == -100] = tokenizer.pad_token_id
+        refs.extend(tokenizer.batch_decode(labels, skip_special_tokens=True))
+    set_active_task(model, None)
+    return _rouge_l(preds, refs)
 
-    autocast     = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
-    unlearn_iter = _infinite(unlearn_loader) if unlearn_loader is not None else None
-    start        = time.time()
+
+@torch.no_grad()
+def eval_forget_score(model, examples, tokenizer, task_idx,
+                      max_source_length=256, max_target_length=128,
+                      batch_size=8):
+    """
+    Forget score = mean loss on unlearn targets using task_idx's adapter.
+    High loss = model cannot generate the unlearn targets = good unlearning.
+    Normalized to [0,1] by clamping at 10.
+    """
+    from safety_data import SafetyDataset
+    ds = SafetyDataset(examples, tokenizer,
+                       max_source_length=max_source_length,
+                       max_target_length=max_target_length)
+    loader = DataLoader(ds, batch_size=batch_size, shuffle=False)
+
+    set_active_task(model, task_idx)
+    model.eval()
+    total_loss, n = 0.0, 0
+    for batch in loader:
+        out = model(
+            input_ids=batch["input_ids"].cuda(),
+            attention_mask=batch["attention_mask"].cuda(),
+            labels=batch["labels"].cuda())
+        total_loss += out.loss.item()
+        n += 1
+    set_active_task(model, None)
+
+    avg_loss = total_loss / max(n, 1)
+    return min(avg_loss / 10.0, 1.0)   # normalized: higher = better unlearning
+
+
+def _train_one_task(model, loader, is_unlearn, epochs,
+                    grad_accum_steps, learning_rate,
+                    gpm_hook=None, log_every=100):
+    """
+    Standard training loop.
+    is_unlearn=True: negate the loss (gradient ascent) and clamp it.
+    """
+    params = trainable_lora_params(model) + gating_params(model)
+    optimizer = AdamW(params, lr=learning_rate)
+    autocast  = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
+    start     = time.time()
 
     for epoch in range(epochs):
         model.train()
-        ep_learn, ep_unlearn, n = 0.0, 0.0, 0
-        learn_opt.zero_grad()
-        if unlearn_opt:
-            unlearn_opt.zero_grad()
+        ep_loss, n = 0.0, 0
+        optimizer.zero_grad()
 
-        for step, lb in enumerate(learn_loader):
-
-            # Learn: gradient descent
+        for step, batch in enumerate(loader):
             with autocast:
-                out = model(input_ids=lb["input_ids"].cuda(),
-                            attention_mask=lb["attention_mask"].cuda(),
-                            labels=lb["labels"].cuda())
-                learn_loss = out.loss / grad_accum_steps
-            learn_loss.backward()
-            ep_learn += learn_loss.item() * grad_accum_steps
+                out = model(
+                    input_ids=batch["input_ids"].cuda(),
+                    attention_mask=batch["attention_mask"].cuda(),
+                    labels=batch["labels"].cuda())
+                raw_loss = out.loss
 
-            # Unlearn: gradient ascent, clamped
-            if unlearn_iter is not None:
-                ub = next(unlearn_iter)
-                with autocast:
-                    uout = model(input_ids=ub["input_ids"].cuda(),
-                                 attention_mask=ub["attention_mask"].cuda(),
-                                 labels=ub["labels"].cuda())
-                    raw = uout.loss
-                clamped = torch.clamp(raw, max=UNLEARN_CAP)
-                (-clamped / grad_accum_steps).backward()
-                ep_unlearn += clamped.item()
+            if is_unlearn:
+                # Gradient ascent: maximize loss on unlearn targets
+                clamped = torch.clamp(raw_loss, max=UNLEARN_CAP)
+                loss = -clamped / grad_accum_steps
+                ep_loss += clamped.item()
+            else:
+                loss = raw_loss / grad_accum_steps
+                ep_loss += raw_loss.item()
 
+            loss.backward()
             n += 1
 
             if (step + 1) % grad_accum_steps == 0:
-                # Clip unlearn grads before GPM projection
-                if unlearn_opt:
-                    torch.nn.utils.clip_grad_norm_(
-                        trainable_unlearn_params(model) + unlearn_gate_params(model),
-                        max_norm=1.0)
+                if is_unlearn:
+                    torch.nn.utils.clip_grad_norm_(params, max_norm=1.0)
                 if gpm_hook:
                     gpm_hook()
-                learn_opt.step();   learn_opt.zero_grad()
-                if unlearn_opt:
-                    unlearn_opt.step(); unlearn_opt.zero_grad()
+                optimizer.step()
+                optimizer.zero_grad()
 
             if (step + 1) % log_every == 0:
-                ul = ep_unlearn / max(n, 1)
+                direction = "↑ascent" if is_unlearn else "↓descent"
                 print(f"    e{epoch+1} s{step+1}  "
-                      f"learn={ep_learn/n:.4f}  unlearn={ul:.4f}")
+                      f"loss={ep_loss/n:.4f} {direction}")
 
-        # Flush
         if (step + 1) % grad_accum_steps != 0:
-            if unlearn_opt:
-                torch.nn.utils.clip_grad_norm_(
-                    trainable_unlearn_params(model) + unlearn_gate_params(model),
-                    max_norm=1.0)
+            if is_unlearn:
+                torch.nn.utils.clip_grad_norm_(params, max_norm=1.0)
             if gpm_hook:
                 gpm_hook()
-            learn_opt.step(); learn_opt.zero_grad()
-            if unlearn_opt:
-                unlearn_opt.step(); unlearn_opt.zero_grad()
+            optimizer.step()
+            optimizer.zero_grad()
 
         if (epoch + 1) % 10 == 0 or epoch == 0:
-            print(f"  epoch {epoch+1:3d}  "
-                  f"learn={ep_learn/max(n,1):.4f}  "
-                  f"unlearn={ep_unlearn/max(n,1):.4f}  "
-                  f"t={time.time()-start:.0f}s")
+            direction = "ascent" if is_unlearn else "descent"
+            print(f"  epoch {epoch+1:3d}  loss={ep_loss/max(n,1):.4f} "
+                  f"({direction})  t={time.time()-start:.0f}s")
 
 
-def _collect_gpm(gpm, model, learn_loader):
+def run_safety_gainlora(
+    task_order=None,          # list of task keys, e.g. ["task0","task1",...]
+    epochs=50,
+    train_batch_size=2,
+    grad_accum_steps=16,
+    learning_rate=3e-4,
+    lora_r=4, lora_alpha=32, lora_dropout=0.0,
+    router_hidden_dim=100,
+    gpm_threshold=0.97,
+    n_train=500, n_eval=100,
+    max_source_length=256, max_target_length=128,
+    log_every=200,
+):
+    """
+    Full 6-task sequential GainLoRA safety experiment.
+
+    Default order: PKU-Learn → PKU-Unlearn → BBQ-Learn → BBQ-Unlearn
+                   → TruthfulQA-Learn → TruthfulQA-Unlearn
+
+    For the task-order experiment, pass a different task_order list.
+    """
+    tasks, task_names = load_all_tasks(n_train=n_train, n_eval=n_eval)
+
+    if task_order is None:
+        task_order = ["task0", "task1", "task2", "task3", "task4", "task5"]
+
+    T = len(task_order)
+
+    print(f"\n{'='*60}")
+    print(f"SAFETY GAINLORA: {T} tasks")
+    print(f"Order: {' → '.join(task_names[k] for k in task_order)}")
+    print(f"lr={learning_rate}, unlearn_cap={UNLEARN_CAP}, "
+          f"batch={train_batch_size*grad_accum_steps}, r={lora_r}")
+    print(f"{'='*60}")
+
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    loaders   = make_dataloaders(
+        tasks, tokenizer, batch_size=train_batch_size,
+        max_source_length=max_source_length,
+        max_target_length=max_target_length)
+
+    # Standard GainLoRA model — single adapter per task
+    model = build_model(
+        MODEL_NAME, lora_r=lora_r, lora_alpha=lora_alpha,
+        lora_dropout=lora_dropout, router_hidden_dim=router_hidden_dim).cuda()
+    enable_gating(model, True)
+
+    # A_learn[j][i]  = ROUGE-L on task i's LEARN eval after training task j
+    # A_forget[j][i] = forget score on task i's UNLEARN eval after training task j
+    A_learn  = [[None]*T for _ in range(T)]
+    A_forget = [[None]*T for _ in range(T)]
+    gpm      = GPM(threshold=gpm_threshold)
+
+    for t, task_key in enumerate(task_order):
+        task_data  = tasks[task_key]
+        task_name  = task_names[task_key]
+        is_unlearn = task_data["train"][0]["is_unlearn"]  # True for unlearn tasks
+        loader     = loaders[task_key]
+
+        print(f"\n{'─'*60}")
+        print(f"TASK {t+1}/{T}: {task_name}  "
+              f"[{'UNLEARN — gradient ascent' if is_unlearn else 'LEARN — gradient descent'}]")
+        print(f"{'─'*60}")
+
+        gpm_hook = gpm.make_projection_hook(model) if t > 0 else None
+
+        _train_one_task(
+            model, loader,
+            is_unlearn=is_unlearn,
+            epochs=epochs,
+            grad_accum_steps=grad_accum_steps,
+            learning_rate=learning_rate,
+            gpm_hook=gpm_hook,
+            log_every=log_every,
+        )
+        _free()
+
+        # ── Eval all tasks seen so far ────────────────────────────────────
+        print(f"\n  Evaluating after {task_name}...")
+        model.eval()
+        for i in range(t + 1):
+            tk        = task_order[i]
+            td        = tasks[tk]
+            is_unl_i  = td["train"][0]["is_unlearn"]
+
+            if is_unl_i:
+                # Unlearn task: measure forget score (high = good unlearning)
+                score = eval_forget_score(
+                    model, td["eval"], tokenizer, task_idx=i,
+                    max_source_length=max_source_length,
+                    max_target_length=max_target_length)
+                A_forget[t][i] = score
+                A_learn[t][i]  = 0.0
+                print(f"    [{i}] {task_names[tk]:40s}: "
+                      f"forget_score={score:.4f} "
+                      f"(higher=better unlearning)")
+            else:
+                # Learn task: measure ROUGE-L
+                score = evaluate_task(
+                    model, td["eval"], tokenizer, task_idx=i,
+                    max_source_length=max_source_length,
+                    max_target_length=max_target_length)
+                A_learn[t][i]  = score
+                A_forget[t][i] = 0.0
+                print(f"    [{i}] {task_names[tk]:40s}: "
+                      f"ROUGE-L={score:.4f}")
+        _free()
+
+        # ── GPM: collect + add_task ───────────────────────────────────────
+        if t < T - 1:
+            print(f"\n  Collecting GPM activations for {task_name}...")
+            _collect_gpm(gpm, model, loader)
+            add_task(model)
+            print(f"  router now has {model.router.n_tasks} tasks")
+            gpm.project_init_G3(model)
+
+    # ── Final metrics ─────────────────────────────────────────────────────
+    for j in range(T):
+        for i in range(T):
+            if A_learn[j][i]  is None: A_learn[j][i]  = 0.0
+            if A_forget[j][i] is None: A_forget[j][i] = 0.0
+
+    _print_results(A_learn, A_forget, task_order, task_names, tasks, T)
+
+    return {
+        "A_learn":    A_learn,
+        "A_forget":   A_forget,
+        "task_order": task_order,
+        "task_names": task_names,
+        "model":      model,
+        "tokenizer":  tokenizer,
+    }
+
+
+def _collect_gpm(gpm, model, loader):
     from gating import pool_encoder_hidden
     model.eval()
     p0s, p1s, p2s = [], [], []
     with torch.no_grad():
-        for batch in learn_loader:
+        for batch in loader:
             ids  = batch["input_ids"].cuda()
             mask = batch["attention_mask"].cuda()
             p0   = pool_encoder_hidden(model.shared(ids), mask)
             p0s.append(p0.cpu().float())
-            p1, p2 = model.learn_router.current_gate.get_activations(p0)
+            p1, p2 = model.router.current_gate.get_activations(p0)
             p1s.append(p1.cpu().float())
             p2s.append(p2.cpu().float())
     gpm.update_bases({
@@ -148,136 +323,68 @@ def _collect_gpm(gpm, model, learn_loader):
     })
 
 
-def run_safety_gainlora(
-    epochs=50,
-    train_batch_size=2,
-    grad_accum_steps=16,
-    learning_rate=3e-4,
-    lora_r=4, lora_alpha=32, lora_dropout=0.0,
-    router_hidden_dim=100,
-    gpm_threshold=0.97,
-    n_train=500,
-    n_eval=100,
-    max_source_length=256,
-    max_target_length=128,
-    log_every=200,
-):
-    print(f"\n{'='*60}")
-    print(f"SAFETY GAINLORA: PKU + BBQ + TOFU, {epochs} epochs each")
-    print(f"learn_lr={learning_rate}, unlearn_lr={learning_rate*UNLEARN_SCALE}")
-    print(f"unlearn_cap={UNLEARN_CAP}, grad_clip=1.0, batch={train_batch_size*grad_accum_steps}")
-    print(f"{'='*60}")
+def _print_results(A_learn, A_forget, task_order, task_names, tasks, T):
+    print(f"\n{'='*60}\nFINAL RESULTS\n{'='*60}")
 
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    # Separate learn and unlearn task indices
+    learn_idx   = [i for i, k in enumerate(task_order)
+                   if not tasks[k]["train"][0]["is_unlearn"]]
+    unlearn_idx = [i for i, k in enumerate(task_order)
+                   if tasks[k]["train"][0]["is_unlearn"]]
 
-    # ── Load datasets ─────────────────────────────────────────────────────
-    tasks, task_names = load_all_tasks(n_train=n_train, n_eval=n_eval)
-    loaders = make_dataloaders(
-        tasks, tokenizer, batch_size=train_batch_size,
-        max_source_length=max_source_length,
-        max_target_length=max_target_length)
-
-    # ── Model ─────────────────────────────────────────────────────────────
-    model = build_safety_model(
-        MODEL_NAME, lora_r=lora_r, lora_alpha=lora_alpha,
-        lora_dropout=lora_dropout, router_hidden_dim=router_hidden_dim).cuda()
-    safety_enable_gating(model, True)
-
-    T = 3
-    task_keys = ["task0", "task1", "task2"]
-    A_learn  = [[None]*T for _ in range(T)]
-    A_forget = [[None]*T for _ in range(T)]
-    gpm      = GPM(threshold=gpm_threshold)
-
-    for t, task_key in enumerate(task_keys):
-        print(f"\n{'─'*60}")
-        print(f"TASK {t+1}/3: {task_names[task_key]}")
-        print(f"{'─'*60}")
-
-        gpm_hook = gpm.make_projection_hook_dual(model) if t > 0 else None
-
-        train_safety_task(
-            model, tokenizer,
-            learn_loader=loaders[task_key]["learn"],
-            unlearn_loader=loaders[task_key]["unlearn"],
-            epochs=epochs,
-            grad_accum_steps=grad_accum_steps,
-            learning_rate=learning_rate,
-            task_name=task_names[task_key],
-            gpm_hook=gpm_hook,
-            log_every=log_every,
-        )
-        _free()
-
-        # ── Eval all tasks seen so far ────────────────────────────────────
-        print(f"\n  Evaluating after {task_names[task_key]}...")
-        model.eval()
-        for i in range(t + 1):
-            tk = task_keys[i]
-            learn_score = eval_learn_quality(
-                model, tokenizer,
-                tasks[tk]["eval"]["learn"],
-                task_idx=i)
-            forget_score = eval_forget_score(
-                model, tokenizer,
-                tasks[tk]["eval"].get("unlearn"),
-                task_idx=i)
-            A_learn[t][i]  = learn_score
-            A_forget[t][i] = forget_score
-            fs = f"{forget_score:.4f}" if forget_score is not None else "N/A"
-            print(f"    {task_names[tk]:35s}: "
-                  f"ROUGE={learn_score:.4f}  forget={fs}")
-        _free()
-
-        # ── GPM + add_task ────────────────────────────────────────────────
-        if t < T - 1:
-            print(f"\n  Collecting GPM activations for {task_names[task_key]}...")
-            _collect_gpm(gpm, model, loaders[task_key]["learn"])
-            safety_add_task(model)
-            print(f"  router now has {model.learn_router.n_tasks} tasks")
-            gpm.project_init_G3_dual(model)
-
-    # ── Final metrics ─────────────────────────────────────────────────────
+    print(f"\nLearn task ROUGE-L matrix:")
+    headers = [f"T{i}({task_names[task_order[i]][:8]})" for i in learn_idx]
+    print(f"  {'After task':<25} " + " ".join(f"{h:>12}" for h in headers))
     for j in range(T):
-        for i in range(T):
-            if A_learn[j][i]  is None: A_learn[j][i]  = 0.0
-            if A_forget[j][i] is None: A_forget[j][i] = 0.0
-
-    metrics = compute_safety_ap_ft(A_learn, A_forget, T)
-
-    print(f"\n{'='*60}")
-    print(f"FINAL RESULTS")
-    print(f"  AP_learn  = {metrics['AP_learn']:.4f}  (learn quality, higher=better)")
-    print(f"  FT_learn  = {metrics['FT_learn']:.4f}  (learn forgetting, lower=better)")
-    print(f"  AP_forget = {metrics['AP_forget']:.4f}  (unlearn quality, higher=better)")
-    print(f"  FT_forget = {metrics['FT_forget']:.4f}  (unlearn forgetting, lower=better)")
-    print(f"{'='*60}")
-
-    # Full matrix for paper
-    print(f"\nLearn quality matrix (ROUGE-L):")
-    print(f"{'':35s} {'PKU':>7} {'BBQ':>7} {'TOFU':>7}")
-    labels = ["PKU", "BBQ", "TOFU"]
-    for j in range(T):
-        row = f"  After {labels[j]:30s}: "
-        for i in range(T):
+        row = f"  {task_names[task_order[j]][:25]:<25} "
+        for i in learn_idx:
             v = A_learn[j][i]
-            row += f"{v:7.4f}" if v else "    ---"
+            row += f"{v:>12.4f}" if v else "         ---"
         print(row)
 
-    print(f"\nForget score matrix (higher=better unlearning):")
-    print(f"{'':35s} {'PKU':>7} {'BBQ':>7} {'TOFU':>7}")
+    print(f"\nUnlearn task forget score matrix (higher=better):")
+    headers = [f"T{i}({task_names[task_order[i]][:8]})" for i in unlearn_idx]
+    print(f"  {'After task':<25} " + " ".join(f"{h:>12}" for h in headers))
     for j in range(T):
-        row = f"  After {labels[j]:30s}: "
-        for i in range(T):
+        row = f"  {task_names[task_order[j]][:25]:<25} "
+        for i in unlearn_idx:
             v = A_forget[j][i]
-            row += f"{v:7.4f}" if v is not None and v else "    N/A"
+            row += f"{v:>12.4f}" if v else "         ---"
         print(row)
 
-    return {
-        "A_learn":  A_learn,
-        "A_forget": A_forget,
-        "metrics":  metrics,
-        "model":    model,
-        "tokenizer": tokenizer,
-        "task_names": task_names,
-    }
+    # AP and FT for learn tasks
+    last_learn  = [A_learn[T-1][i]  for i in learn_idx]
+    last_forget = [A_forget[T-1][i] for i in unlearn_idx]
+
+    AP_learn  = sum(last_learn)  / len(last_learn)  if last_learn  else 0
+    AP_forget = sum(last_forget) / len(last_forget) if last_forget else 0
+
+    # FT: drop from best to final
+    FT_learn = 0.0
+    for i in learn_idx:
+        best = max(A_learn[j][i] for j in range(i, T) if A_learn[j][i] > 0)
+        FT_learn += best - A_learn[T-1][i]
+    FT_learn /= max(len(learn_idx), 1)
+
+    FT_forget = 0.0
+    for i in unlearn_idx:
+        vals = [A_forget[j][i] for j in range(i, T) if A_forget[j][i] > 0]
+        if vals:
+            FT_forget += max(vals) - A_forget[T-1][i]
+    FT_forget /= max(len(unlearn_idx), 1)
+
+    print(f"\nSummary:")
+    print(f"  AP_learn  = {AP_learn:.4f}   avg ROUGE-L across learn tasks")
+    print(f"  FT_learn  = {FT_learn:.4f}   learn forgetting (lower=better)")
+    print(f"  AP_forget = {AP_forget:.4f}   avg forget score across unlearn tasks")
+    print(f"  FT_forget = {FT_forget:.4f}   unlearn forgetting (lower=better)")
+    print(f"\n  KEY RESULT:")
+    if FT_forget > FT_learn + 0.05:
+        print(f"  ✓ FT_forget ({FT_forget:.4f}) >> FT_learn ({FT_learn:.4f})")
+        print(f"    GainLoRA fails to preserve unlearning across tasks.")
+        print(f"    The GPM subspace built from learn-task inputs suppresses")
+        print(f"    the paired unlearn gate, making unlearn adapters unable")
+        print(f"    to route to the inputs they were trained on.")
+    else:
+        print(f"    FT_forget={FT_forget:.4f}, FT_learn={FT_learn:.4f}")
+        print(f"    Check individual task forget scores above.")
