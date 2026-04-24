@@ -32,20 +32,15 @@ import os
 CHECKPOINT_DIR = "/content/gainlora_690NN/checkpoints"
 
 def save_checkpoint(model, gpm, A_learn, A_forget, completed_tasks, task_order, task_names):
-    """Save everything needed to resume from the next task."""
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
-    t = len(completed_tasks) - 1  # last completed task index
+    t = len(completed_tasks) - 1
 
-    # Save model state
     torch.save(model.state_dict(),
                f"{CHECKPOINT_DIR}/model_after_task{t}.pt")
-
-    # Save GPM bases
     gpm_save = {k: v.cpu() if v is not None else None
                 for k, v in gpm.bases.items()}
     torch.save(gpm_save, f"{CHECKPOINT_DIR}/gpm_after_task{t}.pt")
 
-    # Save matrices and metadata
     import json
     meta = {
         "completed_tasks": completed_tasks,
@@ -59,6 +54,30 @@ def save_checkpoint(model, gpm, A_learn, A_forget, completed_tasks, task_order, 
         json.dump(meta, f, indent=2)
 
     print(f"  ✓ Checkpoint saved: task {t} ({task_names[task_order[t]]})")
+
+    # ── Auto-push to GitHub so checkpoints survive disconnect ─────────────
+    import subprocess
+    GH_TOKEN = os.environ.get("GH_TOKEN", "")
+    try:
+        subprocess.run(["git", "-C", "/content/gainlora_690NN",
+                        "config", "user.email", "juliastgermain@users.noreply.github.com"],
+                       capture_output=True)
+        subprocess.run(["git", "-C", "/content/gainlora_690NN",
+                        "config", "user.name", "juliastgermain"],
+                       capture_output=True)
+        subprocess.run(["git", "-C", "/content/gainlora_690NN",
+                        "add", "checkpoints/"],
+                       capture_output=True)
+        subprocess.run(["git", "-C", "/content/gainlora_690NN",
+                        "commit", "-m", f"checkpoint after task {t}"],
+                       capture_output=True)
+        subprocess.run(["git", "-C", "/content/gainlora_690NN", "push",
+                        f"https://juliastgermain:{GH_TOKEN}@github.com/"
+                        f"juliastgermain/gainlora_690NN.git", "master"],
+                       capture_output=True)
+        print(f"  ✓ Checkpoint pushed to GitHub")
+    except Exception as e:
+        print(f"  ⚠ GitHub push failed: {e} — checkpoint is local only")
 
 
 def find_latest_checkpoint(task_order):
@@ -178,15 +197,16 @@ def eval_forget_score(model, examples, tokenizer, task_idx,
 
 def _train_one_task(model, loader, is_unlearn, epochs,
                     grad_accum_steps, learning_rate,
-                    gpm_hook=None, log_every=100):
-    """
-    Standard training loop.
-    is_unlearn=True: negate the loss (gradient ascent) and clamp it.
-    """
+                    gpm_hook=None, log_every=100,
+                    early_stop_patience=3,     # stop after this many epochs with no improvement
+                    early_stop_delta=0.01):   # minimum change to count as improvement
     params = trainable_lora_params(model) + gating_params(model)
     optimizer = AdamW(params, lr=learning_rate)
     autocast  = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
     start     = time.time()
+
+    best_loss     = float('inf')
+    epochs_no_imp = 0
 
     for epoch in range(epochs):
         model.train()
@@ -202,7 +222,6 @@ def _train_one_task(model, loader, is_unlearn, epochs,
                 raw_loss = out.loss
 
             if is_unlearn:
-                # Gradient ascent: maximize loss on unlearn targets
                 clamped = torch.clamp(raw_loss, max=UNLEARN_CAP)
                 loss = -clamped / grad_accum_steps
                 ep_loss += clamped.item()
@@ -234,10 +253,33 @@ def _train_one_task(model, loader, is_unlearn, epochs,
             optimizer.step()
             optimizer.zero_grad()
 
-        if (epoch + 1) % 10 == 0 or epoch == 0:
+        avg_loss = ep_loss / max(n, 1)
+
+        if (epoch + 1) % 5 == 0 or epoch == 0:
             direction = "ascent" if is_unlearn else "descent"
-            print(f"  epoch {epoch+1:3d}  loss={ep_loss/max(n,1):.4f} "
+            print(f"  epoch {epoch+1:3d}  loss={avg_loss:.4f} "
                   f"({direction})  t={time.time()-start:.0f}s")
+
+        # ── Early stopping ─────────────────────────────────────────────────
+        if is_unlearn:
+            # For unlearn tasks: stop when loss saturates at cap
+            # (avg_loss near UNLEARN_CAP means model has forgotten the content)
+            if avg_loss >= UNLEARN_CAP * 0.99:
+                print(f"  ✓ Early stop epoch {epoch+1}: "
+                      f"unlearn loss saturated at {avg_loss:.4f}")
+                break
+        else:
+            # For learn tasks: stop when improvement < delta for patience epochs
+            if avg_loss < best_loss - early_stop_delta:
+                best_loss     = avg_loss
+                epochs_no_imp = 0
+            else:
+                epochs_no_imp += 1
+                if epochs_no_imp >= early_stop_patience:
+                    print(f"  ✓ Early stop epoch {epoch+1}: "
+                          f"no improvement for {early_stop_patience} epochs "
+                          f"(best={best_loss:.4f}, current={avg_loss:.4f})")
+                    break
 
 
 def run_safety_gainlora(
@@ -377,8 +419,6 @@ def run_safety_gainlora(
                         task_order=task_order,
                         task_names=task_names)
 
-
-
     # ── Final metrics ─────────────────────────────────────────────────────
     for j in range(T):
         for i in range(T):
@@ -397,8 +437,7 @@ def run_safety_gainlora(
         "tokenizer":  tokenizer,
     }
 
-    
-
+  
 
 def _collect_gpm(gpm, model, loader):
     from gating import pool_encoder_hidden
@@ -478,7 +517,7 @@ def _print_results(A_learn, A_forget, task_order, task_names, tasks, T):
     print(f"\n  KEY RESULT:")
     if FT_forget > FT_learn + 0.05:
         print(f"  ✓ FT_forget ({FT_forget:.4f}) >> FT_learn ({FT_learn:.4f})")
-        print(f"    GainLoRA fails to preserve unlearning across tasks.")
+        print(f"    GainLoRA fails to preserve unlearninsaveg across tasks.")
         print(f"    The GPM subspace built from learn-task inputs suppresses")
         print(f"    the paired unlearn gate, making unlearn adapters unable")
         print(f"    to route to the inputs they were trained on.")

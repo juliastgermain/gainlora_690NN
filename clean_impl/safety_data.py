@@ -124,10 +124,10 @@ def load_pku_tasks(n_train=None, n_eval=None, seed=42):
 def load_bbq_tasks(n_train=None, n_eval=None, seed=42):
     print("  Loading BBQ from preset JSON files...")
     task2_train = _rows_to_examples(
-        _load_json("bbq_learn_data.json"),
+        _load_json("bbq_train_learn.json"),
         "Answer without bias: ", is_unlearn=False, n=n_train, seed=seed)
     task3_train = _rows_to_examples(
-        _load_json("bbq_unlearn_data.json"),
+        _load_json("bbq_train_unlearn.json"),
         "Answer without bias: ", is_unlearn=True, n=n_train, seed=seed)
     task2_eval = _rows_to_examples(
         _load_json("bbq_test_factual.json"),        # factual = learn eval
@@ -149,32 +149,22 @@ def load_bbq_tasks(n_train=None, n_eval=None, seed=42):
 # ── TruthfulQA tasks (placeholder) ───────────────────────────────────────────
 
 def load_truthfulqa_tasks(n_train=None, n_eval=None, seed=42):
-    learn_path = os.path.join(DATA_ROOT, "truthfulqa_learn.json")
-    if not os.path.exists(learn_path):
+    if not os.path.exists(os.path.join(DATA_ROOT, "truth_train_learn.json")):
         print("  TruthfulQA: files not yet available, skipping tasks 4/5")
         return {}
-
     print("  Loading TruthfulQA from preset JSON files...")
     task4_train = _rows_to_examples(
-        _load_json("truthfulqa_learn.json"),
+        _load_json("truth_train_learn.json"),
         "Answer truthfully: ", is_unlearn=False, n=n_train, seed=seed)
     task5_train = _rows_to_examples(
-        _load_json("truthfulqa_unlearn.json"),
+        _load_json("truth_train_unlearn.json"),
         "Answer truthfully: ", is_unlearn=True, n=n_train, seed=seed)
-
-    eval_learn_path = os.path.join(DATA_ROOT, "truthfulqa_eval_learn.json")
-    if os.path.exists(eval_learn_path):
-        task4_eval = _rows_to_examples(
-            _load_json("truthfulqa_eval_learn.json"),
-            "Answer truthfully: ", is_unlearn=False, n=n_eval, seed=seed+1)
-        task5_eval = _rows_to_examples(
-            _load_json("truthfulqa_eval_unlearn.json"),
-            "Answer truthfully: ", is_unlearn=True, n=n_eval, seed=seed+1)
-    else:
-        # Fall back to tail of training data
-        task4_eval = task4_train[-(n_eval or 100):]
-        task5_eval = task5_train[-(n_eval or 100):]
-
+    task4_eval = _rows_to_examples(
+        _load_json("truth_test_anchor.json"),
+        "Answer truthfully: ", is_unlearn=False, n=n_eval, seed=seed+1)
+    task5_eval = _rows_to_examples(
+        _load_json("truth_test_refusal.json"),
+        "Answer truthfully: ", is_unlearn=True, n=n_eval, seed=seed+1)
     print(f"    TruthfulQA-Learn:   {len(task4_train)} train, {len(task4_eval)} eval")
     print(f"    TruthfulQA-Unlearn: {len(task5_train)} train, {len(task5_eval)} eval")
     return {
