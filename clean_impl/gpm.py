@@ -162,38 +162,3 @@ class GPM:
                         gate.G3.weight.grad = g - g @ M @ M.T
 
         return _project
-
-    def project_init_G3_dual(self, model):
-        """Project BOTH learn and unlearn router G3s."""
-        if "M3" not in self.bases or self.bases["M3"] is None:
-            return
-        for router_name in ["learn_router", "unlearn_router"]:
-            router = getattr(model, router_name)
-            M = self.bases["M3"].to(router.current_gate.G3.weight.device)
-            g = router.current_gate.G3.weight.data
-            router.current_gate.G3.weight.data = g - g @ M @ M.T
-        print(f"  GPM: projected G3 ⊥ M3 for both learn and unlearn routers")
-
-    def make_projection_hook_dual(self, model):
-        """Project gradients for both learn and unlearn routers."""
-        def _project():
-            with torch.no_grad():
-                for router_name in ["learn_router", "unlearn_router"]:
-                    router = getattr(model, router_name)
-                    gate = router.current_gate
-                    if "M1" in self.bases and self.bases["M1"] is not None:
-                        if gate.G1.weight.grad is not None:
-                            M = self.bases["M1"].to(gate.G1.weight.grad.device)
-                            g = gate.G1.weight.grad
-                            gate.G1.weight.grad = g - g @ M @ M.T
-                    if "M2" in self.bases and self.bases["M2"] is not None:
-                        if gate.G2.weight.grad is not None:
-                            M = self.bases["M2"].to(gate.G2.weight.grad.device)
-                            g = gate.G2.weight.grad
-                            gate.G2.weight.grad = g - g @ M @ M.T
-                    if "M3" in self.bases and self.bases["M3"] is not None:
-                        if gate.G3.weight.grad is not None:
-                            M = self.bases["M3"].to(gate.G3.weight.grad.device)
-                            g = gate.G3.weight.grad
-                            gate.G3.weight.grad = g - g @ M @ M.T
-        return _project
