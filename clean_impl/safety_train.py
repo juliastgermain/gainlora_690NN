@@ -27,6 +27,77 @@ from gpm import GPM
 from model import (build_model, add_task, enable_gating,
                    trainable_lora_params, gating_params, set_active_task)
 
+import os
+
+CHECKPOINT_DIR = "/content/gainlora_690NN/checkpoints"
+
+def save_checkpoint(model, gpm, A_learn, A_forget, completed_tasks, task_order, task_names):
+    """Save everything needed to resume from the next task."""
+    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+    t = len(completed_tasks) - 1  # last completed task index
+
+    # Save model state
+    torch.save(model.state_dict(),
+               f"{CHECKPOINT_DIR}/model_after_task{t}.pt")
+
+    # Save GPM bases
+    gpm_save = {k: v.cpu() if v is not None else None
+                for k, v in gpm.bases.items()}
+    torch.save(gpm_save, f"{CHECKPOINT_DIR}/gpm_after_task{t}.pt")
+
+    # Save matrices and metadata
+    import json
+    meta = {
+        "completed_tasks": completed_tasks,
+        "task_order":      task_order,
+        "task_names":      task_names,
+        "A_learn":         A_learn,
+        "A_forget":        A_forget,
+        "n_router_tasks":  model.router.n_tasks,
+    }
+    with open(f"{CHECKPOINT_DIR}/meta_after_task{t}.json", "w") as f:
+        json.dump(meta, f, indent=2)
+
+    print(f"  ✓ Checkpoint saved: task {t} ({task_names[task_order[t]]})")
+
+
+def find_latest_checkpoint(task_order):
+    """Return index of last completed task, or -1 if none."""
+    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+    for t in range(len(task_order) - 1, -1, -1):
+        if os.path.exists(f"{CHECKPOINT_DIR}/model_after_task{t}.pt"):
+            print(f"  Found checkpoint after task {t}")
+            return t
+    return -1
+
+
+def load_checkpoint(model, gpm, task_idx):
+    """Load model and GPM state from checkpoint at task_idx."""
+    import json
+
+    # Load model weights
+    state = torch.load(f"{CHECKPOINT_DIR}/model_after_task{task_idx}.pt",
+                       map_location="cuda")
+    # Strict=False because router grows dynamically —
+    # we need to pre-grow the router before loading
+    model.load_state_dict(state, strict=False)
+
+    # Load GPM bases
+    gpm_save = torch.load(f"{CHECKPOINT_DIR}/gpm_after_task{task_idx}.pt",
+                          map_location="cpu")
+    gpm.bases = gpm_save
+
+    # Load metadata
+    with open(f"{CHECKPOINT_DIR}/meta_after_task{task_idx}.json") as f:
+        meta = json.load(f)
+
+    print(f"  ✓ Loaded checkpoint: task {task_idx} "
+          f"({meta['task_names'][meta['task_order'][task_idx]]})")
+    return meta
+
+
+
+
 MODEL_NAME  = "t5-large"
 UNLEARN_CAP = 5.0   # clamp gradient ascent loss to prevent explosion
 
@@ -222,15 +293,34 @@ def run_safety_gainlora(
     A_forget = [[None]*T for _ in range(T)]
     gpm      = GPM(threshold=gpm_threshold)
 
-    for t, task_key in enumerate(task_order):
+    # ── Check for existing checkpoint ─────────────────────────────────────
+    last_completed = find_latest_checkpoint(task_order)
+
+    if last_completed >= 0:
+        print(f"\n  Resuming from checkpoint after task {last_completed}...")
+        import json
+        meta = load_checkpoint(model, gpm, last_completed)
+        A_learn  = meta["A_learn"]
+        A_forget = meta["A_forget"]
+        # Grow router to correct number of tasks
+        n_needed = meta["n_router_tasks"]
+        while model.router.n_tasks < n_needed:
+            add_task(model)
+        start_t = last_completed + 1
+        print(f"  Resuming from task {start_t}/{T}")
+    else:
+        start_t = 0
+
+    for t in range(start_t, T):
+        task_key   = task_order[t]
         task_data  = tasks[task_key]
         task_name  = task_names[task_key]
-        is_unlearn = task_data["train"][0]["is_unlearn"]  # True for unlearn tasks
+        is_unlearn = task_data["train"][0]["is_unlearn"]
         loader     = loaders[task_key]
 
         print(f"\n{'─'*60}")
         print(f"TASK {t+1}/{T}: {task_name}  "
-              f"[{'UNLEARN — gradient ascent' if is_unlearn else 'LEARN — gradient descent'}]")
+              f"[{'UNLEARN' if is_unlearn else 'LEARN'}]")
         print(f"{'─'*60}")
 
         gpm_hook = gpm.make_projection_hook(model) if t > 0 else None
@@ -246,16 +336,14 @@ def run_safety_gainlora(
         )
         _free()
 
-        # ── Eval all tasks seen so far ────────────────────────────────────
+        # Eval
         print(f"\n  Evaluating after {task_name}...")
         model.eval()
         for i in range(t + 1):
-            tk        = task_order[i]
-            td        = tasks[tk]
-            is_unl_i  = td["train"][0]["is_unlearn"]
-
+            tk       = task_order[i]
+            td       = tasks[tk]
+            is_unl_i = td["train"][0]["is_unlearn"]
             if is_unl_i:
-                # Unlearn task: measure forget score (high = good unlearning)
                 score = eval_forget_score(
                     model, td["eval"], tokenizer, task_idx=i,
                     max_source_length=max_source_length,
@@ -263,10 +351,8 @@ def run_safety_gainlora(
                 A_forget[t][i] = score
                 A_learn[t][i]  = 0.0
                 print(f"    [{i}] {task_names[tk]:40s}: "
-                      f"forget_score={score:.4f} "
-                      f"(higher=better unlearning)")
+                      f"forget_score={score:.4f}")
             else:
-                # Learn task: measure ROUGE-L
                 score = evaluate_task(
                     model, td["eval"], tokenizer, task_idx=i,
                     max_source_length=max_source_length,
@@ -277,13 +363,21 @@ def run_safety_gainlora(
                       f"ROUGE-L={score:.4f}")
         _free()
 
-        # ── GPM: collect + add_task ───────────────────────────────────────
+        # GPM + add_task
         if t < T - 1:
             print(f"\n  Collecting GPM activations for {task_name}...")
             _collect_gpm(gpm, model, loader)
             add_task(model)
             print(f"  router now has {model.router.n_tasks} tasks")
             gpm.project_init_G3(model)
+
+        # ── SAVE CHECKPOINT after every task ──────────────────────────────
+        save_checkpoint(model, gpm, A_learn, A_forget,
+                        completed_tasks=task_order[:t+1],
+                        task_order=task_order,
+                        task_names=task_names)
+
+
 
     # ── Final metrics ─────────────────────────────────────────────────────
     for j in range(T):
