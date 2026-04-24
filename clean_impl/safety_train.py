@@ -392,9 +392,12 @@ def run_safety_gainlora(
         "A_forget":   A_forget,
         "task_order": task_order,
         "task_names": task_names,
+        "_tasks":     tasks,        # ADD THIS LINE
         "model":      model,
         "tokenizer":  tokenizer,
     }
+
+    
 
 
 def _collect_gpm(gpm, model, loader):
