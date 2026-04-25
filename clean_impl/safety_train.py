@@ -35,56 +35,57 @@ CHECKPOINT_DIR = "/content/drive/MyDrive/gainlora_checkpoints"  # survives disco
 CHECKPOINT_DIR = "/content/gainlora_690NN/checkpoints"
 
 def save_checkpoint(model, gpm, A_learn, A_forget, completed_tasks, task_order, task_names):
+    import json, subprocess
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
     t = len(completed_tasks) - 1
 
+    # ── Large files → Google Drive (survives disconnects) ──────────────────
     torch.save(model.state_dict(),
                f"{CHECKPOINT_DIR}/model_after_task{t}.pt")
     gpm_save = {k: v.cpu() if v is not None else None
                 for k, v in gpm.bases.items()}
     torch.save(gpm_save, f"{CHECKPOINT_DIR}/gpm_after_task{t}.pt")
+    print(f"  ✓ Model + GPM saved to Google Drive")
 
-    import json
+    # ── Small metadata → GitHub (for visibility + recovery) ────────────────
     meta = {
-        "completed_tasks": completed_tasks,
-        "task_order":      task_order,
-        "task_names":      task_names,
-        "A_learn":         A_learn,
-        "A_forget":        A_forget,
-        "n_router_tasks":  model.router.n_tasks,
+        "completed_tasks":  completed_tasks,
+        "task_order":       task_order,
+        "task_names":       task_names,
+        "A_learn":          A_learn,
+        "A_forget":         A_forget,
+        "n_router_tasks":   model.router.n_tasks,
+        "drive_checkpoint": f"{CHECKPOINT_DIR}/model_after_task{t}.pt",
     }
-    with open(f"{CHECKPOINT_DIR}/meta_after_task{t}.json", "w") as f:
+    meta_path = f"/content/gainlora_690NN/checkpoints/meta_after_task{t}.json"
+    os.makedirs(os.path.dirname(meta_path), exist_ok=True)
+    with open(meta_path, "w") as f:
         json.dump(meta, f, indent=2)
 
-    print(f"  ✓ Checkpoint saved: task {t} ({task_names[task_order[t]]})")
-
-    # ── Auto-push to GitHub so checkpoints survive disconnect ─────────────
-    import subprocess
     GH_TOKEN = os.environ.get("GH_TOKEN", "")
-    try:
-        subprocess.run(["git", "-C", "/content/gainlora_690NN",
-                        "config", "user.email", "juliastgermain@users.noreply.github.com"],
-                       capture_output=True)
-        subprocess.run(["git", "-C", "/content/gainlora_690NN",
-                        "config", "user.name", "juliastgermain"],
-                       capture_output=True)
-        subprocess.run(["git", "-C", "/content/gainlora_690NN",
-                        "add", "checkpoints/"],
-                       capture_output=True)
-        subprocess.run(["git", "-C", "/content/gainlora_690NN",
-                        "commit", "-m", f"checkpoint after task {t}"],
-                       capture_output=True)
-        subprocess.run(["git", "-C", "/content/gainlora_690NN", "push",
-                        f"https://juliastgermain:{GH_TOKEN}@github.com/"
-                        f"juliastgermain/gainlora_690NN.git", "master"],
-                       capture_output=True)
-        print(f"  ✓ Checkpoint pushed to GitHub")
-    except Exception as e:
-        print(f"  ⚠ GitHub push failed: {e} — checkpoint is local only")
+    if GH_TOKEN:
+        try:
+            subprocess.run(["git", "-C", "/content/gainlora_690NN",
+                            "add", "checkpoints/"], capture_output=True)
+            subprocess.run(["git", "-C", "/content/gainlora_690NN",
+                            "commit", "-m", f"checkpoint meta task {t}"],
+                           capture_output=True)
+            subprocess.run(["git", "-C", "/content/gainlora_690NN", "push",
+                            f"https://juliastgermain:{GH_TOKEN}@github.com/"
+                            f"juliastgermain/gainlora_690NN.git", "master"],
+                           capture_output=True)
+            print(f"  ✓ Metadata pushed to GitHub")
+        except Exception as e:
+            print(f"  ⚠ GitHub push failed: {e}")
 
+    print(f"  ✓ Checkpoint complete: task {t} ({task_names[task_order[t]]})")
+
+
+
+MODEL_NAME  = "t5-large"
+UNLEARN_CAP = 5.0   # clamp gradient ascent loss to prevent explosion
 
 def find_latest_checkpoint(task_order):
-    """Return index of last completed task, or -1 if none."""
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
     for t in range(len(task_order) - 1, -1, -1):
         if os.path.exists(f"{CHECKPOINT_DIR}/model_after_task{t}.pt"):
@@ -94,36 +95,23 @@ def find_latest_checkpoint(task_order):
 
 
 def load_checkpoint(model, gpm, task_idx):
-    """Load model and GPM state from checkpoint at task_idx."""
-    import json
-
-    # Load model weights
     state = torch.load(f"{CHECKPOINT_DIR}/model_after_task{task_idx}.pt",
                        map_location="cuda")
-    # Strict=False because router grows dynamically —
-    # we need to pre-grow the router before loading
     model.load_state_dict(state, strict=False)
-
-    # Load GPM bases
     gpm_save = torch.load(f"{CHECKPOINT_DIR}/gpm_after_task{task_idx}.pt",
                           map_location="cpu")
     gpm.bases = gpm_save
 
-    # Load metadata
-    with open(f"{CHECKPOINT_DIR}/meta_after_task{task_idx}.json") as f:
-        meta = json.load(f)
+    # Load metadata from GitHub copy
+    meta_path = f"/content/gainlora_690NN/checkpoints/meta_after_task{task_idx}.json"
+    if os.path.exists(meta_path):
+        with open(meta_path) as f:
+            meta = json.load(f)
+    else:
+        meta = {"A_learn": None, "A_forget": None, "n_router_tasks": task_idx + 1}
 
-    print(f"  ✓ Loaded checkpoint: task {task_idx} "
-          f"({meta['task_names'][meta['task_order'][task_idx]]})")
+    print(f"  ✓ Loaded checkpoint: task {task_idx}")
     return meta
-
-
-
-
-MODEL_NAME  = "t5-large"
-UNLEARN_CAP = 5.0   # clamp gradient ascent loss to prevent explosion
-
-
 def _free():
     gc.collect()
     torch.cuda.empty_cache()
@@ -460,7 +448,34 @@ def _collect_gpm(gpm, model, loader):
         "M2": torch.cat(p1s, dim=0),
         "M3": torch.cat(p2s, dim=0),
     })
+    
+def find_latest_checkpoint(task_order):
+    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+    for t in range(len(task_order) - 1, -1, -1):
+        if os.path.exists(f"{CHECKPOINT_DIR}/model_after_task{t}.pt"):
+            print(f"  Found checkpoint after task {t}")
+            return t
+    return -1
 
+
+def load_checkpoint(model, gpm, task_idx):
+    state = torch.load(f"{CHECKPOINT_DIR}/model_after_task{task_idx}.pt",
+                       map_location="cuda")
+    model.load_state_dict(state, strict=False)
+    gpm_save = torch.load(f"{CHECKPOINT_DIR}/gpm_after_task{task_idx}.pt",
+                          map_location="cpu")
+    gpm.bases = gpm_save
+
+    # Load metadata from GitHub copy
+    meta_path = f"/content/gainlora_690NN/checkpoints/meta_after_task{task_idx}.json"
+    if os.path.exists(meta_path):
+        with open(meta_path) as f:
+            meta = json.load(f)
+    else:
+        meta = {"A_learn": None, "A_forget": None, "n_router_tasks": task_idx + 1}
+
+    print(f"  ✓ Loaded checkpoint: task {task_idx}")
+    return meta
 
 def _print_results(A_learn, A_forget, task_order, task_names, tasks, T):
     print(f"\n{'='*60}\nFINAL RESULTS\n{'='*60}")
