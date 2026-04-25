@@ -28,7 +28,10 @@ from model import (build_model, add_task, enable_gating,
                    trainable_lora_params, gating_params, set_active_task)
 
 import os
-
+# ── Add to top of safety_train.py ─────────────────────────────────────────────
+from google.colab import drive
+drive.mount('/content/drive')
+CHECKPOINT_DIR = "/content/drive/MyDrive/gainlora_checkpoints"  # survives disconnects
 CHECKPOINT_DIR = "/content/gainlora_690NN/checkpoints"
 
 def save_checkpoint(model, gpm, A_learn, A_forget, completed_tasks, task_order, task_names):
