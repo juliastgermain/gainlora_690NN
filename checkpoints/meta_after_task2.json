@@ -1,0 +1,124 @@
+{
+  "completed_tasks": [
+    "task0",
+    "task1",
+    "task2"
+  ],
+  "task_order": [
+    "task0",
+    "task1",
+    "task2",
+    "task3",
+    "task4",
+    "task5"
+  ],
+  "task_names": {
+    "task0": "PKU-Learn (safety)",
+    "task1": "PKU-Unlearn (safety)",
+    "task2": "BBQ-Learn (bias)",
+    "task3": "BBQ-Unlearn (bias)",
+    "task4": "TruthfulQA-Learn (misinformation)",
+    "task5": "TruthfulQA-Unlearn (misinformation)"
+  },
+  "A_learn": [
+    [
+      0.23883335083326873,
+      null,
+      null,
+      null,
+      null,
+      null
+    ],
+    [
+      0.23883335083326873,
+      0.0,
+      null,
+      null,
+      null,
+      null
+    ],
+    [
+      0.23883335083326873,
+      0.0,
+      0.9718334135000801,
+      null,
+      null,
+      null
+    ],
+    [
+      null,
+      null,
+      null,
+      null,
+      null,
+      null
+    ],
+    [
+      null,
+      null,
+      null,
+      null,
+      null,
+      null
+    ],
+    [
+      null,
+      null,
+      null,
+      null,
+      null,
+      null
+    ]
+  ],
+  "A_forget": [
+    [
+      0.0,
+      null,
+      null,
+      null,
+      null,
+      null
+    ],
+    [
+      0.0,
+      1.0,
+      null,
+      null,
+      null,
+      null
+    ],
+    [
+      0.0,
+      1.0,
+      0.0,
+      null,
+      null,
+      null
+    ],
+    [
+      null,
+      null,
+      null,
+      null,
+      null,
+      null
+    ],
+    [
+      null,
+      null,
+      null,
+      null,
+      null,
+      null
+    ],
+    [
+      null,
+      null,
+      null,
+      null,
+      null,
+      null
+    ]
+  ],
+  "n_router_tasks": 4
+}
