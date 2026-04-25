@@ -1,5 +1,6 @@
 {
-  "order_A": [
+  "order": "A_learn_first",
+  "task_order": [
     "task0",
     "task1",
     "task2",
@@ -124,5 +125,11 @@
     "task1": 1.0,
     "task3": 0.6464991972996639,
     "task5": 0.9661464837881235
+  },
+  "key_result": {
+    "BBQ_unlearn_isolated": 1.0,
+    "BBQ_unlearn_gated": 0.6464991972996639,
+    "BBQ_unlearn_drop": 0.3535008027003361,
+    "interpretation": "GainLoRA's GPM suppresses the BBQ-Unlearn gate to 0.44 weight because BBQ-Learn and BBQ-Unlearn share identical prompts. The BBQ-Learn adapter (weight=1.00) counteracts unlearning, reducing forget score from 1.00 to 0.65 in gated inference."
   }
 }
